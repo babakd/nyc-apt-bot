@@ -495,6 +495,135 @@ class TestLLMScoring:
         assert scoring_result.is_fallback is False
 
     @pytest.mark.asyncio
+    async def test_alias_neighborhood_in_scoring_data(self):
+        """Aliased neighborhoods get a 'pref_hood' field in scoring data."""
+        listings = [_make_listing("1", neighborhood="Lincoln Square")]
+        prefs = Preferences(budget_max=4000, neighborhoods=["Upper West Side"])
+
+        scores = [
+            {"id": "1", "include": True, "score": 80, "pros": ["great"], "cons": []},
+        ]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+
+            # Parse the JSON listings from the prompt
+            import re
+            json_match = re.search(r"Listings:\n(.+?)\n\n", prompt_text, re.DOTALL)
+            assert json_match, "Could not find listings JSON in prompt"
+            listings_json = json.loads(json_match.group(1))
+
+            lincoln_sq = [l for l in listings_json if l["id"] == "1"][0]
+            assert lincoln_sq.get("pref_hood") == "Upper West Side"
+
+    @pytest.mark.asyncio
+    async def test_no_alias_field_for_direct_match(self):
+        """Direct neighborhood matches do not get a 'pref_hood' field."""
+        listings = [_make_listing("1", neighborhood="Chelsea")]
+        prefs = Preferences(budget_max=4000, neighborhoods=["Chelsea"])
+
+        scores = [
+            {"id": "1", "include": True, "score": 80, "pros": ["great"], "cons": []},
+        ]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+
+            import re
+            json_match = re.search(r"Listings:\n(.+?)\n\n", prompt_text, re.DOTALL)
+            assert json_match
+            listings_json = json.loads(json_match.group(1))
+
+            chelsea = [l for l in listings_json if l["id"] == "1"][0]
+            assert "pref_hood" not in chelsea
+
+    @pytest.mark.asyncio
+    async def test_alias_prompt_explains_pref_hood(self):
+        """When aliased neighborhoods exist, prompt explains the pref_hood field."""
+        listings = [_make_listing("1", neighborhood="Lincoln Square")]
+        prefs = Preferences(budget_max=4000, neighborhoods=["Upper West Side"])
+
+        scores = [
+            {"id": "1", "include": True, "score": 80, "pros": ["great"], "cons": []},
+        ]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            assert "pref_hood" in prompt_text
+            assert "preferred neighborhood" in prompt_text
+
+    @pytest.mark.asyncio
+    async def test_temperature_zero(self):
+        """LLM scoring uses temperature=0 for deterministic results."""
+        listings = [_make_listing("1")]
+        prefs = Preferences(budget_max=4000)
+
+        scores = [
+            {"id": "1", "include": True, "score": 70, "pros": ["ok"], "cons": []},
+        ]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            kwargs = call_kwargs.kwargs if call_kwargs.kwargs else call_kwargs[1]
+            assert kwargs["temperature"] == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_date_guidance_in_prompt(self):
+        """Scoring prompt includes stale date guidance when move_in_date is set."""
+        listings = [_make_listing("1")]
+        prefs = Preferences(budget_max=4000, move_in_date="April 1, 2025")
+
+        scores = [
+            {"id": "1", "include": True, "score": 70, "pros": ["ok"], "cons": []},
+        ]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            assert "move-in date is in the past" in prompt_text
+
+    @pytest.mark.asyncio
+    async def test_today_date_in_scoring_prompt(self):
+        """Scoring prompt includes today's date."""
+        listings = [_make_listing("1")]
+        prefs = Preferences(budget_max=4000)
+
+        scores = [
+            {"id": "1", "include": True, "score": 70, "pros": ["ok"], "cons": []},
+        ]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            assert "Today's date is" in prompt_text
+
+    @pytest.mark.asyncio
     async def test_current_apartment_in_prompt(self):
         """Current apartment context is included in the LLM prompt when provided."""
         listings = [_make_listing("1")]
@@ -861,6 +990,142 @@ class TestScanForChat:
             for call in mock_bot.send_text.call_args_list
         ]
         assert not any("None of these perfectly matched" in t for t in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_aliased_neighborhood_passes_through_full_pipeline(self):
+        """Aliased neighborhood (Lincoln Square→Upper West Side) passes pre-filter and reaches LLM."""
+        state = self._make_state()
+        state.preferences.neighborhoods = ["Upper West Side"]
+
+        raw_listings = [
+            _raw_listing("1", neighborhood="Lincoln Square"),
+        ]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing("1", neighborhood="Lincoln Square", match_score=80, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings),
+            ) as mock_llm,
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+            # Verify the listing reached LLM scoring (passed pre-filter)
+            call_args = mock_llm.call_args
+            filtered_input = call_args[0][0]
+            assert len(filtered_input) == 1
+            assert filtered_input[0].neighborhood == "Lincoln Square"
+
+        # Verify listing was sent to user
+        assert mock_bot.send_text.call_count >= 2  # header + listing card
+        # Verify stored in recent_listings
+        assert "1" in state.recent_listings
+
+    @pytest.mark.asyncio
+    async def test_cleared_history_rescores_previously_seen(self):
+        """After clearing seen_listing_ids, previously seen listings are re-scored and sent."""
+        state = self._make_state()
+        state.seen_listing_ids = {"1", "2"}
+        # Simulate clearing history
+        state.seen_listing_ids.clear()
+
+        raw_listings = [
+            _raw_listing("1", neighborhood="Chelsea"),
+            _raw_listing("2", neighborhood="SoHo"),
+        ]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing("1", neighborhood="Chelsea", match_score=75, photos=[]),
+            _make_listing("2", neighborhood="SoHo", match_score=70, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings),
+            ) as mock_llm,
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+            # Both listings should reach LLM scoring
+            call_args = mock_llm.call_args
+            filtered_input = call_args[0][0]
+            assert len(filtered_input) == 2
+            ids = {l.listing_id for l in filtered_input}
+            assert ids == {"1", "2"}
+
+        # Both should be sent to user
+        assert mock_bot.send_text.call_count >= 1  # header
+        # Both stored in recent
+        assert "1" in state.recent_listings
+        assert "2" in state.recent_listings
+
+    @pytest.mark.asyncio
+    async def test_all_excluded_fallback_returns_top3_with_caveat(self):
+        """When all 5 listings excluded, top 3 by score returned with caveat message."""
+        state = self._make_state()
+
+        raw_listings = [
+            _raw_listing(str(i), neighborhood="Chelsea") for i in range(1, 6)
+        ]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        # Top 3 by score: listing 3 (50), listing 1 (40), listing 2 (35)
+        fallback_listings = [
+            _make_listing("3", neighborhood="Chelsea", match_score=50, photos=[]),
+            _make_listing("1", neighborhood="Chelsea", match_score=40, photos=[]),
+            _make_listing("2", neighborhood="Chelsea", match_score=35, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=fallback_listings, is_fallback=True),
+            ),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+        # Verify exactly 3 listings sent (as text, no photos)
+        assert mock_bot.send_text.call_count >= 2  # header + caveat + 3 listing cards
+
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        # Caveat message present
+        assert any("None of these perfectly matched" in t for t in sent_texts)
 
     @pytest.mark.asyncio
     async def test_hero_photo_used_when_available(self):

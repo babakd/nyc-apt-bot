@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import anthropic
@@ -283,6 +283,8 @@ async def _llm_score_listings(
     if not listings:
         return ScoringResult(listings=listings)
 
+    logger.info("LLM scoring %d listings", len(listings))
+
     # Format listings compactly
     listings_data = []
     for l in listings:
@@ -295,6 +297,11 @@ async def _llm_score_listings(
             "baths": l.bathrooms,
             "fee": l.broker_fee or "No fee",
         }
+        # Add canonical neighborhood mapping if aliased
+        hood_lower = l.neighborhood.lower()
+        canonical = NEIGHBORHOOD_ALIASES.get(hood_lower)
+        if canonical:
+            entry["pref_hood"] = canonical.title()
         if l.sqft:
             entry["sqft"] = l.sqft
         if l.available_date:
@@ -356,8 +363,11 @@ async def _llm_score_listings(
         if apt_parts:
             apt_text = "\nCurrent apartment:\n" + "\n".join(apt_parts)
 
+    today = date.today().strftime("%B %d, %Y")
+
     prompt = (
         "Filter and score these NYC apartment listings against the user's preferences.\n"
+        f"Today's date is {today}.\n"
         "Return ONLY a JSON array, no other text.\n\n"
         f"User preferences:\n{prefs_text}{constraint_text}{apt_text}\n\n"
         f"Listings:\n{json.dumps(listings_data, separators=(',', ':'))}\n\n"
@@ -376,6 +386,10 @@ async def _llm_score_listings(
         "- 40-59: Decent — some compromises but worth considering\n"
         "- 25-39: Weak — misses some criteria but still viable\n"
         "- 0-24: Poor match\n\n"
+        "The 'pref_hood' field, when present, shows which preferred neighborhood a listing maps to "
+        "(e.g. Lincoln Square maps to Upper West Side). Treat these as being in the preferred neighborhood.\n\n"
+        "If the user's move-in date is in the past, treat it as 'ASAP' — do not penalize "
+        "listings for having availability dates after a past move-in date.\n\n"
         "Be nuanced: a slightly over-budget listing in a perfect location can score well. "
         "Adjacent neighborhoods to preferred areas are good, not zero. "
         "Must-haves matter more than nice-to-haves. "
@@ -389,6 +403,7 @@ async def _llm_score_listings(
         response = await client.messages.create(
             model=SCORING_MODEL,
             max_tokens=8192,
+            temperature=0,
             messages=[{"role": "user", "content": prompt}],
         )
 
