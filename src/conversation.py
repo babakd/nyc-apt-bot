@@ -53,6 +53,15 @@ describe results without actually calling the tool.
 - If a search fails or returns no results, say so honestly — do not fabricate listings.
 - Every action (search, update preferences, clear history, etc.) must go through its tool call.
 
+IMPORTANT — Tool result visibility:
+The user CANNOT see tool results. Tool results are only returned to you as context. \
+You MUST include any relevant data from tool results in your text response. \
+For example, when you call show_preferences and receive the user's preferences back, \
+you MUST relay that information in your message — the user will only see what you write. \
+Never say "here they are" or "there you go" without actually including the data. \
+The same applies to get_liked_listings, get_listing_details, compare_listings, \
+and show_current_apartment — always include the substance in your response.
+
 IMPORTANT — Constraint context:
 When updating preferences, also set the constraint_context field to summarize what's firm \
 (dealbreakers) vs flexible (nice-to-haves) based on how the user talks about their criteria. \
@@ -403,6 +412,23 @@ class ConversationEngine:
     def __init__(self, state: ChatState, claude: ClaudeClient | None = None):
         self.state = state
         self.claude = claude or ClaudeClient()
+        self._tool_dispatch: dict[str, Any] = {
+            "update_preferences": lambda inp, res: self._tool_update_preferences(inp),
+            "show_preferences": lambda inp, res: self._tool_show_preferences(),
+            "search_apartments": lambda inp, res: self._tool_search_apartments(res),
+            "mark_ready": lambda inp, res: self._tool_mark_ready(),
+            "clear_search_history": lambda inp, res: self._tool_clear_search_history(),
+            "pause_daily_scans": lambda inp, res: self._tool_pause_daily_scans(),
+            "get_liked_listings": lambda inp, res: self._tool_get_liked_listings(),
+            "remove_liked_listing": lambda inp, res: self._tool_remove_liked_listing(inp),
+            "reset_preferences": lambda inp, res: self._tool_reset_preferences(),
+            "remove_neighborhoods": lambda inp, res: self._tool_remove_neighborhoods(inp),
+            "get_listing_details": lambda inp, res: self._tool_get_listing_details(inp),
+            "compare_listings": lambda inp, res: self._tool_compare_listings(inp),
+            "draft_outreach": lambda inp, res: self._tool_draft_outreach(inp, res),
+            "update_current_apartment": lambda inp, res: self._tool_update_current_apartment(inp),
+            "show_current_apartment": lambda inp, res: self._tool_show_current_apartment(),
+        }
 
     async def handle_message(self, text: str, sender_name: str | None = None) -> ConversationResult:
         """Handle a user message by sending it to Claude with tools.
@@ -549,38 +575,10 @@ class ConversationEngine:
 
     def _execute_tool(self, name: str, input_data: dict[str, Any], result: ConversationResult) -> str:
         """Execute a tool call and return the result as a string."""
-        if name == "update_preferences":
-            return self._tool_update_preferences(input_data)
-        elif name == "show_preferences":
-            return self._tool_show_preferences()
-        elif name == "search_apartments":
-            return self._tool_search_apartments(result)
-        elif name == "mark_ready":
-            return self._tool_mark_ready()
-        elif name == "clear_search_history":
-            return self._tool_clear_search_history()
-        elif name == "pause_daily_scans":
-            return self._tool_pause_daily_scans()
-        elif name == "get_liked_listings":
-            return self._tool_get_liked_listings()
-        elif name == "remove_liked_listing":
-            return self._tool_remove_liked_listing(input_data)
-        elif name == "reset_preferences":
-            return self._tool_reset_preferences()
-        elif name == "remove_neighborhoods":
-            return self._tool_remove_neighborhoods(input_data)
-        elif name == "get_listing_details":
-            return self._tool_get_listing_details(input_data)
-        elif name == "compare_listings":
-            return self._tool_compare_listings(input_data)
-        elif name == "draft_outreach":
-            return self._tool_draft_outreach(input_data, result)
-        elif name == "update_current_apartment":
-            return self._tool_update_current_apartment(input_data)
-        elif name == "show_current_apartment":
-            return self._tool_show_current_apartment()
-        else:
+        handler = self._tool_dispatch.get(name)
+        if not handler:
             return f"Unknown tool: {name}"
+        return handler(input_data, result)
 
     def _tool_update_preferences(self, input_data: dict[str, Any]) -> str:
         """Update user preferences from tool call input."""

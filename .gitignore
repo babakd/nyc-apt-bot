@@ -31,6 +31,10 @@ env/
 # Claude project context (internal AI assistant file)
 CLAUDE.md
 
+# Decision docs (local only)
+orchestrator_bug.md
+agent_sdk_tradeoff.md
+
 # OS
 .DS_Store
 Thumbs.db

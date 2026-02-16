@@ -12,6 +12,7 @@ import anthropic
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-4-6"
+MAX_TOOL_ITERATIONS = 10
 
 
 @dataclass
@@ -63,8 +64,9 @@ class ClaudeClient:
         """
         working_messages = list(messages)
         new_messages: list[dict[str, Any]] = []
+        all_text_parts: list[str] = []
 
-        while True:
+        for _iteration in range(MAX_TOOL_ITERATIONS):
             response = await self.client.messages.create(
                 model=self.model,
                 max_tokens=1024,
@@ -74,12 +76,11 @@ class ClaudeClient:
             )
 
             # Collect text and tool_use blocks
-            text_parts: list[str] = []
             tool_uses: list[dict[str, Any]] = []
 
             for block in response.content:
-                if block.type == "text":
-                    text_parts.append(block.text)
+                if block.type == "text" and block.text:
+                    all_text_parts.append(block.text)
                 elif block.type == "tool_use":
                     tool_uses.append({
                         "id": block.id,
@@ -87,9 +88,9 @@ class ClaudeClient:
                         "input": block.input,
                     })
 
-            # If no tool calls, return the text
+            # If no tool calls, we're done
             if not tool_uses:
-                return ChatResult(text="\n".join(text_parts), tool_messages=new_messages)
+                break
 
             # Serialize response content blocks to plain dicts for persistence
             serialized_content = [_serialize_block(b) for b in response.content]
@@ -103,6 +104,7 @@ class ClaudeClient:
             for tool_use in tool_uses:
                 try:
                     result = await tool_handler(tool_use["name"], tool_use["input"])
+                    logger.debug("Tool %s succeeded", tool_use["name"])
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_use["id"],
@@ -120,3 +122,7 @@ class ClaudeClient:
             # Feed tool results back
             working_messages.append({"role": "user", "content": tool_results})
             new_messages.append({"role": "user", "content": tool_results})
+        else:
+            logger.warning("Tool loop hit max iterations (%d)", MAX_TOOL_ITERATIONS)
+
+        return ChatResult(text="\n\n".join(all_text_parts), tool_messages=new_messages)

@@ -696,6 +696,14 @@ class TestSystemPrompt:
         assert "MUST use the search_apartments tool" in prompt
         assert "Never simulate tool output" in prompt
 
+    def test_system_prompt_instructs_tool_results_not_visible(self, fresh_state):
+        """System prompt tells Claude that tool results are not visible to the user."""
+        engine = ConversationEngine(fresh_state)
+        prompt = engine._build_system_prompt()
+
+        assert "CANNOT see tool results" in prompt
+        assert "MUST include any relevant data from tool results" in prompt
+
     def test_system_prompt_includes_constraint_context(self, state_with_prefs):
         """System prompt includes constraint_context when present."""
         state_with_prefs.preferences.constraint_context = (
@@ -910,3 +918,25 @@ class TestResponseEscaping:
         # Verify the escape function was applied (no raw < or & in error message)
         text = result.responses[0].text
         assert "trouble" in text.lower()
+
+
+class TestToolDispatchDict:
+    def test_all_tool_names_registered(self, fresh_state):
+        """Every tool in TOOLS must have a handler in _tool_dispatch."""
+        from src.conversation import TOOLS
+
+        engine = ConversationEngine(fresh_state)
+        tool_names = {t["name"] for t in TOOLS}
+        dispatch_names = set(engine._tool_dispatch.keys())
+
+        assert tool_names == dispatch_names, (
+            f"Mismatch — in TOOLS but not dispatch: {tool_names - dispatch_names}; "
+            f"in dispatch but not TOOLS: {dispatch_names - tool_names}"
+        )
+
+    def test_unknown_tool_returns_error(self, fresh_state):
+        """Unknown tool names return an error string."""
+        engine = ConversationEngine(fresh_state)
+        result = ConversationResult()
+        msg = engine._execute_tool("nonexistent_tool", {}, result)
+        assert "Unknown tool" in msg
