@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.models import ChatState, CurrentApartment, Listing, Preferences
+from src.apify_scraper import ApifyScraperError
 from src.scanner import (
+    CACHE_MAX_AGE_HOURS,
     NEIGHBORHOOD_ALIASES,
     SCORE_FLOOR,
     ScoringResult,
+    _enrich_listings,
+    _extract_listing_detail,
+    _get_cached_listings,
+    _has_cached_scan,
     _llm_score_listings,
     _neighborhood_pre_filter,
+    _parse_listing,
     _pick_hero_photos,
     _sample_photo_keys,
     _vision_pick_heroes,
@@ -552,7 +559,7 @@ class TestScanForChat:
         ]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -593,7 +600,7 @@ class TestScanForChat:
         ]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -619,7 +626,7 @@ class TestScanForChat:
         ]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -653,7 +660,7 @@ class TestScanForChat:
         raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -683,7 +690,7 @@ class TestScanForChat:
         state = self._make_state()
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=[])
+        mock_scraper.search_with_retry = AsyncMock(return_value=[])
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -708,7 +715,7 @@ class TestScanForChat:
         ]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -747,7 +754,7 @@ class TestScanForChat:
         raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -779,7 +786,7 @@ class TestScanForChat:
         state = self._make_state()
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(
+        mock_scraper.search_with_retry = AsyncMock(
             side_effect=Exception("Apify timeout")
         )
 
@@ -800,7 +807,7 @@ class TestScanForChat:
         raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -835,7 +842,7 @@ class TestScanForChat:
         raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -870,7 +877,7 @@ class TestScanForChat:
         raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
 
         mock_scraper = AsyncMock()
-        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
 
         mock_bot = AsyncMock()
         mock_bot.send_text = AsyncMock()
@@ -1049,3 +1056,595 @@ class TestHeroPhotoPicker:
 
         # Letter "Z" doesn't map to any key, so listing "1" should be omitted
         assert "1" not in result
+
+    @pytest.mark.asyncio
+    async def test_large_batch_split(self):
+        """15 listings are split into 2 API calls (12 + 3)."""
+        listings = [
+            _make_listing(str(i), photo_keys=[f"k{i}a", f"k{i}b", f"k{i}c"])
+            for i in range(15)
+        ]
+
+        # Vision model picks photo "A" for every listing
+        picks_batch1 = {str(i): "A" for i in range(12)}
+        picks_batch2 = {str(i): "A" for i in range(12, 15)}
+
+        call_count = 0
+
+        def make_response(picks):
+            resp = MagicMock()
+            resp.content = [MagicMock(text=json.dumps(picks))]
+            return resp
+
+        async def mock_create(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return make_response(picks_batch1)
+            return make_response(picks_batch2)
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(side_effect=mock_create)
+
+        async def fake_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.content = b"\xff\xd8\xff\xe0fake"
+            return resp
+
+        mock_http = AsyncMock()
+        mock_http.get = fake_get
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client),
+            patch("src.scanner.httpx.AsyncClient", return_value=mock_http),
+        ):
+            result = await _pick_hero_photos(listings)
+
+        # Should have made 2 API calls (12 + 3 listings)
+        assert call_count == 2
+        # Should have results for all 15 listings
+        assert len(result) == 15
+
+    @pytest.mark.asyncio
+    async def test_at_batch_limit(self):
+        """12 listings (exactly at batch limit) → 1 API call."""
+        listings = [
+            _make_listing(str(i), photo_keys=[f"k{i}a", f"k{i}b"])
+            for i in range(12)
+        ]
+
+        picks = {str(i): "A" for i in range(12)}
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps(picks))]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        async def fake_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.content = b"\xff\xd8\xff\xe0fake"
+            return resp
+
+        mock_http = AsyncMock()
+        mock_http.get = fake_get
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client),
+            patch("src.scanner.httpx.AsyncClient", return_value=mock_http),
+        ):
+            result = await _pick_hero_photos(listings)
+
+        # Should have made exactly 1 API call
+        assert mock_client.messages.create.call_count == 1
+        assert len(result) == 12
+
+
+# ---------------------------------------------------------------------------
+# E) Concession data in _parse_listing tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseListingConcessions:
+    def test_concession_data_flows_through(self):
+        """net_effective_price and months_free are passed through _parse_listing."""
+        raw = _raw_listing(
+            "1",
+            net_effective_price=15833,
+            months_free=2.0,
+        )
+        listing = _parse_listing(raw)
+        assert listing.net_effective_price == 15833
+        assert listing.months_free == 2.0
+
+    def test_no_concession_data(self):
+        """Missing concession fields default to None."""
+        raw = _raw_listing("1")
+        listing = _parse_listing(raw)
+        assert listing.net_effective_price is None
+        assert listing.months_free is None
+
+
+# ---------------------------------------------------------------------------
+# F) Enrichment tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractListingDetail:
+    def test_next_data_extraction(self):
+        """Extracts amenities and description from __NEXT_DATA__ JSON."""
+        html = '''
+        <html><body>
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"listingData":{
+            "amenities":["Dishwasher","Elevator","Doorman"],
+            "description":"Spacious 2BR in Chelsea with great views."
+        }}}}
+        </script>
+        </body></html>
+        '''
+        amenities, description = _extract_listing_detail(html)
+        assert amenities == ["Dishwasher", "Elevator", "Doorman"]
+        assert description == "Spacious 2BR in Chelsea with great views."
+
+    def test_json_ld_fallback(self):
+        """Falls back to JSON-LD when __NEXT_DATA__ is absent."""
+        html = '''
+        <html><body>
+        <script type="application/ld+json">
+        {"@type":"Apartment","amenityFeature":[{"name":"Laundry"},{"name":"Gym"}],
+         "description":"Great apartment in SoHo."}
+        </script>
+        </body></html>
+        '''
+        amenities, description = _extract_listing_detail(html)
+        assert amenities == ["Laundry", "Gym"]
+        assert description == "Great apartment in SoHo."
+
+    def test_no_data_returns_empty(self):
+        """Returns empty when no structured data is found."""
+        html = "<html><body><p>Nothing here</p></body></html>"
+        amenities, description = _extract_listing_detail(html)
+        assert amenities == []
+        assert description is None
+
+    def test_malformed_json_returns_empty(self):
+        """Handles malformed JSON gracefully."""
+        html = '<html><body><script id="__NEXT_DATA__" type="application/json">{broken</script></body></html>'
+        amenities, description = _extract_listing_detail(html)
+        assert amenities == []
+        assert description is None
+
+    def test_dict_amenities_with_name_key(self):
+        """Handles amenities as list of dicts with 'name' key."""
+        html = '''
+        <html><body>
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"listingData":{
+            "amenities":[{"name":"Pool"},{"name":"Concierge"}]
+        }}}}
+        </script>
+        </body></html>
+        '''
+        amenities, description = _extract_listing_detail(html)
+        assert amenities == ["Pool", "Concierge"]
+
+
+class TestEnrichListings:
+    @pytest.mark.asyncio
+    async def test_enrichment_populates_data(self):
+        """Successful enrichment populates amenities and description."""
+        listings = [
+            _make_listing("1", amenities=[], description=None),
+        ]
+        listings[0].url = "https://streeteasy.com/rental/1"
+
+        html = '''
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"listingData":{
+            "amenities":["Dishwasher","Elevator"],
+            "description":"Nice place"
+        }}}}
+        </script>
+        '''
+
+        mock_run = {"status": "SUCCEEDED", "defaultDatasetId": "ds123"}
+        mock_dataset = AsyncMock()
+        mock_dataset.list_items = AsyncMock(return_value=MagicMock(
+            items=[{"url": "https://streeteasy.com/rental/1", "html": html}]
+        ))
+
+        mock_actor = AsyncMock()
+        mock_actor.call = AsyncMock(return_value=mock_run)
+
+        mock_client = AsyncMock()
+        mock_client.actor = MagicMock(return_value=mock_actor)
+        mock_client.dataset = MagicMock(return_value=mock_dataset)
+
+        with (
+            patch("src.scanner.ApifyClientAsync", return_value=mock_client),
+            patch.dict("os.environ", {"APIFY_API_TOKEN": "test-token"}),
+        ):
+            result = await _enrich_listings(listings)
+
+        assert result[0].amenities == ["Dishwasher", "Elevator"]
+        assert result[0].description == "Nice place"
+
+    @pytest.mark.asyncio
+    async def test_enrichment_failure_graceful(self):
+        """Apify failure returns listings unchanged (graceful degradation)."""
+        listings = [
+            _make_listing("1", amenities=[], description=None),
+        ]
+        listings[0].url = "https://streeteasy.com/rental/1"
+
+        with (
+            patch("src.scanner.ApifyClientAsync", side_effect=Exception("Apify down")),
+            patch.dict("os.environ", {"APIFY_API_TOKEN": "test-token"}),
+        ):
+            result = await _enrich_listings(listings)
+
+        assert len(result) == 1
+        assert result[0].amenities == []
+        assert result[0].description is None
+
+    @pytest.mark.asyncio
+    async def test_enrichment_no_token_skips(self):
+        """Missing APIFY_API_TOKEN skips enrichment."""
+        listings = [_make_listing("1")]
+        with patch.dict("os.environ", {}, clear=True):
+            result = await _enrich_listings(listings)
+        assert result is listings
+
+    @pytest.mark.asyncio
+    async def test_enrichment_preserves_existing_data(self):
+        """Enrichment doesn't overwrite existing amenities/description."""
+        listings = [
+            _make_listing("1", amenities=["Existing"], description="Existing desc"),
+        ]
+        listings[0].url = "https://streeteasy.com/rental/1"
+
+        html = '''
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"listingData":{
+            "amenities":["New"],
+            "description":"New desc"
+        }}}}
+        </script>
+        '''
+
+        mock_run = {"status": "SUCCEEDED", "defaultDatasetId": "ds123"}
+        mock_dataset = AsyncMock()
+        mock_dataset.list_items = AsyncMock(return_value=MagicMock(
+            items=[{"url": "https://streeteasy.com/rental/1", "html": html}]
+        ))
+
+        mock_actor = AsyncMock()
+        mock_actor.call = AsyncMock(return_value=mock_run)
+
+        mock_client = AsyncMock()
+        mock_client.actor = MagicMock(return_value=mock_actor)
+        mock_client.dataset = MagicMock(return_value=mock_dataset)
+
+        with (
+            patch("src.scanner.ApifyClientAsync", return_value=mock_client),
+            patch.dict("os.environ", {"APIFY_API_TOKEN": "test-token"}),
+        ):
+            result = await _enrich_listings(listings)
+
+        # Should NOT overwrite existing data
+        assert result[0].amenities == ["Existing"]
+        assert result[0].description == "Existing desc"
+
+
+# ---------------------------------------------------------------------------
+# G) LLM scoring payload tests (enriched data, concessions, canonical hoods)
+# ---------------------------------------------------------------------------
+
+
+class TestLLMScoringPayload:
+    @pytest.mark.asyncio
+    async def test_description_in_prompt(self):
+        """Description appears in LLM scoring payload (truncated to 300 chars)."""
+        long_desc = "A" * 500
+        listings = [_make_listing("1", description=long_desc)]
+        prefs = Preferences(budget_max=4000)
+
+        scores = [{"id": "1", "include": True, "score": 70, "pros": [], "cons": []}]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            # Truncated to 300 chars
+            assert "A" * 300 in prompt_text
+            assert "A" * 301 not in prompt_text
+
+    @pytest.mark.asyncio
+    async def test_concessions_in_prompt(self):
+        """Net effective price and months free appear in LLM scoring payload."""
+        listings = [_make_listing("1", price=19000, net_effective_price=15833, months_free=2.0)]
+        prefs = Preferences(budget_max=16000)
+
+        scores = [{"id": "1", "include": True, "score": 70, "pros": [], "cons": []}]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            assert "15833" in prompt_text
+            assert "net_effective" in prompt_text
+
+    @pytest.mark.asyncio
+    async def test_concessions_not_in_prompt_when_same_price(self):
+        """No net effective in listing data when it equals gross price."""
+        listings = [_make_listing("1", price=3500, net_effective_price=3500)]
+        prefs = Preferences(budget_max=4000)
+
+        scores = [{"id": "1", "include": True, "score": 70, "pros": [], "cons": []}]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            # The listing data JSON should not contain "net_effective":3500
+            # (prompt instructions will mention "net_effective" but that's expected)
+            assert '"net_effective":3500' not in prompt_text
+
+    @pytest.mark.asyncio
+    async def test_canonical_neighborhood_in_prompt(self):
+        """Canonical neighborhood name appears in LLM scoring payload for alias matches."""
+        listings = [_make_listing("1", neighborhood="Lincoln Square")]
+        prefs = Preferences(budget_max=4000, neighborhoods=["Upper West Side"])
+
+        scores = [{"id": "1", "include": True, "score": 70, "pros": [], "cons": []}]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            assert "hood_canonical" in prompt_text
+            assert "Upper West Side" in prompt_text
+
+    @pytest.mark.asyncio
+    async def test_no_canonical_for_direct_match(self):
+        """No hood_canonical value in listing data when neighborhood directly matches."""
+        listings = [_make_listing("1", neighborhood="Chelsea")]
+        prefs = Preferences(budget_max=4000, neighborhoods=["Chelsea"])
+
+        scores = [{"id": "1", "include": True, "score": 70, "pros": [], "cons": []}]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            # Chelsea is not in NEIGHBORHOOD_ALIASES, so no hood_canonical in the listing data
+            # The prompt instructions mention hood_canonical, but that's expected
+            listings_json_part = prompt_text.split("Listings:\n")[1].split("\n\nTwo-step")[0]
+            assert "hood_canonical" not in listings_json_part
+
+    @pytest.mark.asyncio
+    async def test_temperature_zero(self):
+        """temperature=0 is set in the LLM scoring API call."""
+        listings = [_make_listing("1")]
+        prefs = Preferences(budget_max=4000)
+
+        scores = [{"id": "1", "include": True, "score": 70, "pros": [], "cons": []}]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
+            assert kwargs.get("temperature") == 0
+
+    @pytest.mark.asyncio
+    async def test_enrichment_wired_in_pipeline(self):
+        """Enrichment is called between pre-filter and LLM scoring in scan_for_chat."""
+        state = ChatState(chat_id=12345)
+        state.preferences.budget_max = 4000
+        state.preferences.neighborhoods = ["Chelsea"]
+        state.preferences_ready = True
+
+        raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing("1", neighborhood="Chelsea", match_score=80, photos=[]),
+        ]
+
+        call_order = []
+
+        async def mock_enrich(listings):
+            call_order.append("enrich")
+            return listings
+
+        async def mock_llm_score(listings, prefs, current_apt=None):
+            call_order.append("llm_score")
+            return ScoringResult(listings=scored_listings)
+
+        with (
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
+            patch("src.scanner._enrich_listings", side_effect=mock_enrich) as mock_enrich_fn,
+            patch("src.scanner._llm_score_listings", side_effect=mock_llm_score),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+        assert call_order == ["enrich", "llm_score"]
+        mock_enrich_fn.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# H) Scan cache fallback tests
+# ---------------------------------------------------------------------------
+
+
+class TestScanCacheFallback:
+    def _make_state(self, **overrides) -> ChatState:
+        state = ChatState(chat_id=12345)
+        state.preferences.budget_max = 4000
+        state.preferences.neighborhoods = ["Chelsea"]
+        state.preferences_ready = True
+        for key, val in overrides.items():
+            setattr(state, key, val)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_cache_fallback_on_scraper_failure(self):
+        """Cached listings re-sent when scraper fails."""
+        listing = _make_listing("1", neighborhood="Chelsea", match_score=80, photos=["http://img.jpg"])
+        state = self._make_state()
+        state.recent_listings["1"] = listing
+        state.last_scan_listing_ids = ["1"]
+        state.last_scan_at = datetime.now(timezone.utc) - timedelta(hours=1)
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(
+            side_effect=ApifyScraperError("WAF block")
+        )
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        await scan_for_chat(mock_scraper, mock_bot, state)
+
+        # Should send the "temporarily unavailable" message + cached listing
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        assert any("temporarily unavailable" in t for t in sent_texts)
+        assert mock_bot.send_listing_photo.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_expired_shows_error(self):
+        """Stale cache (>48h) falls through to error message."""
+        listing = _make_listing("1", neighborhood="Chelsea", match_score=80)
+        state = self._make_state()
+        state.recent_listings["1"] = listing
+        state.last_scan_listing_ids = ["1"]
+        state.last_scan_at = datetime.now(timezone.utc) - timedelta(hours=CACHE_MAX_AGE_HOURS + 1)
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(
+            side_effect=ApifyScraperError("WAF block")
+        )
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+
+        await scan_for_chat(mock_scraper, mock_bot, state)
+
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        assert any("trouble searching StreetEasy" in t for t in sent_texts)
+        assert not any("temporarily unavailable" in t for t in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_cache_evicted_listings_skipped(self):
+        """Graceful when some cached IDs are missing from recent_listings."""
+        listing = _make_listing("2", neighborhood="Chelsea", match_score=70, photos=[])
+        state = self._make_state()
+        state.recent_listings["2"] = listing
+        state.last_scan_listing_ids = ["1", "2", "3"]  # 1 and 3 are evicted
+        state.last_scan_at = datetime.now(timezone.utc) - timedelta(hours=1)
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(
+            side_effect=ApifyScraperError("WAF block")
+        )
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        await scan_for_chat(mock_scraper, mock_bot, state)
+
+        # Should still send available cached listing (text, since no photos)
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        assert any("temporarily unavailable" in t for t in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_no_cache_shows_error(self):
+        """No cache at all falls through to error message."""
+        state = self._make_state()
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(
+            side_effect=ApifyScraperError("WAF block")
+        )
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+
+        await scan_for_chat(mock_scraper, mock_bot, state)
+
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        assert any("trouble searching StreetEasy" in t for t in sent_texts)
+
+
+class TestEnrichmentConfig:
+    @pytest.mark.asyncio
+    async def test_enrichment_uses_reduced_concurrency(self):
+        """Verify maxConcurrency=3, maxRequestRetries=2, US proxy."""
+        listings = [_make_listing("1", amenities=[], description=None)]
+        listings[0].url = "https://streeteasy.com/rental/1"
+
+        mock_run = {"status": "SUCCEEDED", "defaultDatasetId": "ds123"}
+        mock_dataset = AsyncMock()
+        mock_dataset.list_items = AsyncMock(return_value=MagicMock(items=[]))
+
+        mock_actor = AsyncMock()
+        mock_actor.call = AsyncMock(return_value=mock_run)
+
+        mock_client = AsyncMock()
+        mock_client.actor = MagicMock(return_value=mock_actor)
+        mock_client.dataset = MagicMock(return_value=mock_dataset)
+
+        with (
+            patch("src.scanner.ApifyClientAsync", return_value=mock_client),
+            patch.dict("os.environ", {"APIFY_API_TOKEN": "test-token"}),
+        ):
+            await _enrich_listings(listings)
+
+        call_kwargs = mock_actor.call.call_args
+        run_input = call_kwargs.kwargs.get("run_input") or call_kwargs[1].get("run_input")
+        assert run_input["maxConcurrency"] == 3
+        assert run_input["maxRequestRetries"] == 2
+        assert run_input["proxy"]["countryCode"] == "US"

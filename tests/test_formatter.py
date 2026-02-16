@@ -146,6 +146,37 @@ class TestListingCard:
         card = format_listing_card(listing)
         assert "750 sqft" in card
 
+    def test_card_with_concession(self):
+        """Card displays net effective price when concession data is present."""
+        listing = Listing(
+            listing_id="123",
+            url="https://streeteasy.com/rental/123",
+            address="100 Main St",
+            neighborhood="Chelsea",
+            price=19000,
+            bedrooms=2,
+            bathrooms=1.0,
+            net_effective_price=15833,
+            months_free=2.0,
+        )
+        card = format_listing_card(listing)
+        assert "$19,000" in card
+        assert "$15,833 net" in card
+
+    def test_card_without_concession(self):
+        """Card does not display net effective when concession data is absent."""
+        listing = Listing(
+            listing_id="123",
+            url="https://streeteasy.com/rental/123",
+            address="100 Main St",
+            neighborhood="Chelsea",
+            price=3500,
+            bedrooms=1,
+            bathrooms=1.0,
+        )
+        card = format_listing_card(listing)
+        assert "net" not in card.lower()
+
     def test_card_caption_length(self):
         """Card should fit within Telegram's 1024-char sendPhoto caption limit."""
         listing = Listing(
@@ -160,6 +191,28 @@ class TestListingCard:
             broker_fee="Broker fee",
             available_date="2026-04-01",
             match_score=75,
+            pros=["Great location", "Doorman building", "In-unit laundry"],
+            cons=["No dishwasher", "5th floor walk-up"],
+        )
+        card = format_listing_card(listing, rank=1)
+        assert len(card) < 1024
+
+    def test_card_caption_length_with_concession(self):
+        """Card with concession data still fits within 1024-char limit."""
+        listing = Listing(
+            listing_id="123",
+            url="https://streeteasy.com/rental/123",
+            address="123 Very Long Street Name Apartment #24B",
+            neighborhood="Upper East Side",
+            price=19000,
+            bedrooms=2,
+            bathrooms=1.5,
+            sqft=900,
+            broker_fee="Broker fee",
+            available_date="2026-04-01",
+            match_score=75,
+            net_effective_price=15833,
+            months_free=2.0,
             pros=["Great location", "Doorman building", "In-unit laundry"],
             cons=["No dishwasher", "5th floor walk-up"],
         )

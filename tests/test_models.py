@@ -1,6 +1,6 @@
 """Tests for Pydantic models."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.models import ChatState, ConversationTurn, CurrentApartment, Draft, Listing, Preferences
 
@@ -413,3 +413,73 @@ class TestConstraintContext:
         restored = ChatState.model_validate_json(data)
         assert restored.preferences.constraint_context == "Budget firm, bedrooms flexible"
         assert restored.preferences.budget_max == 4000
+
+
+class TestConcessionFields:
+    def test_defaults_to_none(self):
+        """net_effective_price and months_free default to None."""
+        listing = Listing(
+            listing_id="1", url="", address="", neighborhood="",
+            price=3000, bedrooms=1, bathrooms=1,
+        )
+        assert listing.net_effective_price is None
+        assert listing.months_free is None
+
+    def test_set_concession_fields(self):
+        """Concession fields can be set."""
+        listing = Listing(
+            listing_id="1", url="", address="", neighborhood="",
+            price=19000, bedrooms=2, bathrooms=1,
+            net_effective_price=15833, months_free=2.0,
+        )
+        assert listing.net_effective_price == 15833
+        assert listing.months_free == 2.0
+
+    def test_json_roundtrip(self):
+        """Concession fields survive JSON serialization."""
+        listing = Listing(
+            listing_id="1", url="https://streeteasy.com/rental/1",
+            address="100 Main St", neighborhood="Chelsea",
+            price=19000, bedrooms=2, bathrooms=1,
+            net_effective_price=15833, months_free=2.0,
+        )
+        data = listing.model_dump_json()
+        restored = Listing.model_validate_json(data)
+        assert restored.net_effective_price == 15833
+        assert restored.months_free == 2.0
+
+    def test_backward_compatibility(self):
+        """Old JSON without concession fields loads correctly."""
+        old_json = '{"listing_id": "1", "url": "", "address": "", "neighborhood": "", "price": 3000, "bedrooms": 1, "bathrooms": 1}'
+        listing = Listing.model_validate_json(old_json)
+        assert listing.net_effective_price is None
+        assert listing.months_free is None
+
+
+class TestScanCache:
+    def test_scan_cache_defaults(self):
+        """New cache fields default correctly."""
+        state = ChatState(chat_id=12345)
+        assert state.last_scan_listing_ids == []
+        assert state.last_scan_at is None
+
+    def test_scan_cache_json_roundtrip(self):
+        """Cache fields survive JSON serialization."""
+        now = datetime.now(timezone.utc)
+        state = ChatState(chat_id=12345)
+        state.last_scan_listing_ids = ["1", "2", "3"]
+        state.last_scan_at = now
+
+        data = state.model_dump_json()
+        restored = ChatState.model_validate_json(data)
+        assert restored.last_scan_listing_ids == ["1", "2", "3"]
+        assert restored.last_scan_at is not None
+        # Timestamps should be close (sub-second precision differences possible)
+        assert abs((restored.last_scan_at - now).total_seconds()) < 1
+
+    def test_scan_cache_backward_compat(self):
+        """Old JSON without cache fields loads fine."""
+        old_json = '{"chat_id": 12345}'
+        state = ChatState.model_validate_json(old_json)
+        assert state.last_scan_listing_ids == []
+        assert state.last_scan_at is None

@@ -52,6 +52,8 @@ class Listing(BaseModel):
     broker_fee: Optional[str] = None
     available_date: Optional[str] = None
     description: Optional[str] = None
+    net_effective_price: Optional[int] = None
+    months_free: Optional[float] = None
     match_score: Optional[int] = Field(None, ge=0, le=100)
     pros: list[str] = Field(default_factory=list)
     cons: list[str] = Field(default_factory=list)
@@ -97,5 +99,7 @@ class ChatState(BaseModel):
     active_drafts: dict[str, Draft] = Field(default_factory=dict)
     pending_draft_edit: Optional[str] = Field(None)
     current_apartment: Optional[CurrentApartment] = None
+    last_scan_listing_ids: list[str] = Field(default_factory=list)
+    last_scan_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

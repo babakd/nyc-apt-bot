@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -12,6 +13,9 @@ from src.config import NEIGHBORHOODS, STREETEASY_RENTALS
 from src.models import Preferences
 
 logger = logging.getLogger(__name__)
+
+POLL_INTERVAL_SECS = 10
+ABORT_AFTER_SECS_NO_ITEMS = 60
 
 
 class ApifyScraperError(Exception):
@@ -29,9 +33,10 @@ class ApifyScraper:
     async def search_streeteasy(self, prefs: Preferences) -> list[dict[str, Any]]:
         """Call Apify actor with a StreetEasy search URL, return listing dicts.
 
-        The scraper is intentionally dumb — it fetches raw data and maps it to
-        a flat dict format.  All intelligent filtering, scoring, and ranking is
-        handled downstream by the LLM.
+        Uses start + poll + abort pattern instead of blocking .call():
+        - Polls every POLL_INTERVAL_SECS for status/items
+        - Aborts if ABORT_AFTER_SECS_NO_ITEMS elapsed with 0 items
+        - Uses maxRequestRetries=15 (down from actor default of 100)
         """
         url = _build_streeteasy_url(prefs)
         logger.info("Searching StreetEasy via Apify: %s", url)
@@ -39,28 +44,98 @@ class ApifyScraper:
         run_input = {
             "startUrls": [{"url": url}],
             "maxItems": 1000,
+            "maxRequestRetries": 15,
             "proxy": {
                 "useApifyProxy": True,
                 "apifyProxyGroups": ["RESIDENTIAL"],
+                "countryCode": "US",
             },
         }
 
-        run = await self._client.actor(self._actor_id).call(
+        # Start the actor run (non-blocking)
+        run_info = await self._client.actor(self._actor_id).start(
             run_input=run_input,
-            timeout_secs=300,
             memory_mbytes=512,
         )
 
-        if not run or run.get("status") != "SUCCEEDED":
-            raise ApifyScraperError(f"Actor run failed: {run}")
+        run_id = run_info["id"]
+        dataset_id = run_info["defaultDatasetId"]
+        run_client = self._client.run(run_id)
+        dataset_client = self._client.dataset(dataset_id)
+        elapsed = 0
 
-        dataset = self._client.dataset(run["defaultDatasetId"])
-        result = await dataset.list_items()
+        # Poll until terminal status
+        while True:
+            await asyncio.sleep(POLL_INTERVAL_SECS)
+            elapsed += POLL_INTERVAL_SECS
+
+            run_data = await run_client.get()
+            status = (run_data or {}).get("status", "")
+
+            if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                break
+
+            # Check item count while still running
+            ds_info = await dataset_client.get()
+            item_count = (ds_info or {}).get("itemCount", 0)
+            logger.info(
+                "Apify poll: %ds elapsed, status=%s, items=%d",
+                elapsed, status, item_count,
+            )
+
+            if elapsed >= ABORT_AFTER_SECS_NO_ITEMS and item_count == 0:
+                logger.warning(
+                    "Aborting Apify run after %ds with 0 items (likely WAF block)",
+                    elapsed,
+                )
+                await run_client.abort()
+                raise ApifyScraperError(
+                    f"Actor run aborted after {elapsed}s with 0 items"
+                )
+
+        # Check final status
+        if status != "SUCCEEDED":
+            raise ApifyScraperError(f"Actor run failed with status: {status}")
+
+        result = await dataset_client.list_items()
 
         listings = [_map_apify_item(item) for item in result.items]
         listings = [l for l in listings if l is not None]
         logger.info("Fetched %d listings from Apify", len(listings))
         return listings
+
+    async def search_with_retry(
+        self,
+        prefs: Preferences,
+        max_retries: int = 2,
+        retry_delays: tuple[int, ...] = (30, 60),
+    ) -> list[dict[str, Any]]:
+        """Wrap search_streeteasy with exponential backoff retries.
+
+        Retries on ApifyScraperError or empty results.
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(1 + max_retries):
+            try:
+                logger.info("search_with_retry: attempt %d/%d", attempt + 1, 1 + max_retries)
+                results = await self.search_streeteasy(prefs)
+                if results:
+                    return results
+                # Empty results — treat as retryable
+                logger.warning("search_with_retry: attempt %d returned 0 results", attempt + 1)
+                last_error = ApifyScraperError("Empty results from Apify")
+            except ApifyScraperError as e:
+                logger.warning("search_with_retry: attempt %d failed: %s", attempt + 1, e)
+                last_error = e
+
+            # Delay before next retry (if we have retries left)
+            if attempt < max_retries:
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else retry_delays[-1]
+                logger.info("search_with_retry: waiting %ds before retry", delay)
+                await asyncio.sleep(delay)
+
+        raise last_error or ApifyScraperError("All retries exhausted")
 
 
 def _build_streeteasy_url(prefs: Preferences) -> str:
@@ -164,4 +239,6 @@ def _map_apify_item(item: dict[str, Any]) -> dict[str, Any] | None:
         "photo_keys": photo_keys,
         "available_date": node.get("availableAt"),
         "broker_fee": None if node.get("noFee", False) else "Broker fee",
+        "net_effective_price": int(node.get("netEffectivePrice")) if node.get("netEffectivePrice") else None,
+        "months_free": float(node.get("monthsFree")) if node.get("monthsFree") else None,
     }

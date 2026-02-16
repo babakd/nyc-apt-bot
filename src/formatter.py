@@ -51,6 +51,8 @@ def format_listing_card(listing: Listing, rank: int | None = None) -> str:
 
     # Neighborhood · price · fee
     price_line = f"{_escape_html(listing.neighborhood)} · <b>${listing.price:,}/mo</b>"
+    if listing.months_free and listing.net_effective_price:
+        price_line += f" · <i>${listing.net_effective_price:,} net</i>"
     if not listing.broker_fee:
         price_line += " · NO FEE"
     parts.append(price_line)

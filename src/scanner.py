@@ -7,17 +7,21 @@ import base64
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 import anthropic
 import httpx
+from apify_client import ApifyClientAsync
 
 from src.formatter import format_listing_card, format_scan_header, listing_keyboard
 from src.models import MAX_RECENT_LISTINGS, ChatState, CurrentApartment, Listing, Preferences
-from src.apify_scraper import ApifyScraper, STREETEASY_PHOTO_URL, STREETEASY_PHOTO_URL_THUMB
+from src.apify_scraper import ApifyScraper, ApifyScraperError, STREETEASY_PHOTO_URL, STREETEASY_PHOTO_URL_THUMB
 from src.storage import load_all_states, save_state
+
+CACHE_MAX_AGE_HOURS = 48
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +105,39 @@ async def scan_for_chat(
     prefs = state.preferences
     logger.info("Scanning for chat %s with prefs: %s", state.chat_id, prefs.neighborhoods)
 
-    # Search StreetEasy via Apify actor
+    # Search StreetEasy via Apify actor (with retry)
     try:
-        raw_listings = await scraper.search_streeteasy(prefs)
+        raw_listings = await scraper.search_with_retry(prefs)
     except Exception:
         logger.exception("StreetEasy search failed")
+        # Try cache fallback
+        if _has_cached_scan(state):
+            cached = _get_cached_listings(state)
+            if cached:
+                await telegram_bot.send_text(
+                    state.chat_id,
+                    "\u26a0\ufe0f StreetEasy is temporarily unavailable. "
+                    "Here are your results from last time:",
+                )
+                for i, listing in enumerate(cached, 1):
+                    card_text = format_listing_card(listing, rank=i)
+                    keyboard = listing_keyboard(listing.listing_id, listing.url)
+                    photo_url = listing.photos[0] if listing.photos else None
+                    if photo_url:
+                        await telegram_bot.send_listing_photo(
+                            state.chat_id,
+                            listing_url=listing.url,
+                            photo_url=photo_url,
+                            caption=card_text,
+                            keyboard=keyboard,
+                        )
+                    else:
+                        await telegram_bot.send_text(
+                            state.chat_id,
+                            card_text,
+                            keyboard=keyboard,
+                        )
+                return
         await telegram_bot.send_text(
             state.chat_id,
             "\u26a0\ufe0f I had trouble searching StreetEasy today. I'll try again tomorrow.",
@@ -150,6 +182,9 @@ async def scan_for_chat(
         )
         save_state(state)
         return
+
+    # Enrich with amenities/description from listing pages
+    filtered = await _enrich_listings(filtered)
 
     # Layer 2: LLM filter + score
     scoring_result = await _llm_score_listings(filtered, prefs, state.current_apartment)
@@ -202,6 +237,11 @@ async def scan_for_chat(
                     keyboard=keyboard,
                 )
 
+    # Cache successful scan results
+    if scored:
+        state.last_scan_listing_ids = [l.listing_id for l in scored]
+        state.last_scan_at = datetime.now(timezone.utc)
+
     save_state(state)
     logger.info("Sent %d listings to chat %s", len(scored), state.chat_id)
 
@@ -223,8 +263,188 @@ def _parse_listing(raw: dict) -> Listing:
         broker_fee=raw.get("broker_fee"),
         available_date=raw.get("available_date"),
         description=raw.get("description"),
+        net_effective_price=raw.get("net_effective_price"),
+        months_free=raw.get("months_free"),
         scraped_at=datetime.now(timezone.utc),
     )
+
+
+def _has_cached_scan(state: ChatState) -> bool:
+    """Check if a recent cached scan exists (< CACHE_MAX_AGE_HOURS old)."""
+    if not state.last_scan_listing_ids or not state.last_scan_at:
+        return False
+    age_hours = (datetime.now(timezone.utc) - state.last_scan_at).total_seconds() / 3600
+    return age_hours < CACHE_MAX_AGE_HOURS
+
+
+def _get_cached_listings(state: ChatState) -> list[Listing]:
+    """Look up cached scan listing IDs in recent_listings. Skips missing IDs."""
+    result = []
+    for lid in state.last_scan_listing_ids:
+        listing = state.recent_listings.get(lid)
+        if listing:
+            result.append(listing)
+    return result
+
+
+def _extract_listing_detail(html: str) -> tuple[list[str], str | None]:
+    """Extract amenities and description from a StreetEasy listing page HTML.
+
+    Tries __NEXT_DATA__ JSON first, then falls back to JSON-LD structured data.
+    Returns (amenities, description).
+    """
+    amenities: list[str] = []
+    description: str | None = None
+
+    # Try __NEXT_DATA__ (Next.js data)
+    next_data_match = re.search(
+        r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    if next_data_match:
+        try:
+            data = json.loads(next_data_match.group(1))
+            # Navigate to listing props — structure: props.pageProps.listingData or similar
+            props = data.get("props", {}).get("pageProps", {})
+            # Try common paths for listing data
+            listing_data = props.get("listingData") or props.get("listing") or {}
+            if isinstance(listing_data, dict):
+                # Amenities
+                raw_amenities = listing_data.get("amenities") or listing_data.get("amenityList") or []
+                if isinstance(raw_amenities, list):
+                    for item in raw_amenities:
+                        if isinstance(item, str):
+                            amenities.append(item)
+                        elif isinstance(item, dict):
+                            name = item.get("name") or item.get("label") or ""
+                            if name:
+                                amenities.append(name)
+                # Description
+                desc = listing_data.get("description") or listing_data.get("listingDescription") or ""
+                if desc and isinstance(desc, str):
+                    description = desc.strip()
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+    # Fallback: JSON-LD structured data
+    if not amenities and not description:
+        ld_match = re.search(
+            r'<script\s+type="application/ld\+json">(.*?)</script>',
+            html,
+            re.DOTALL,
+        )
+        if ld_match:
+            try:
+                ld_data = json.loads(ld_match.group(1))
+                if isinstance(ld_data, list):
+                    ld_data = ld_data[0] if ld_data else {}
+                if isinstance(ld_data, dict):
+                    # Schema.org Apartment/Residence
+                    raw_amenities = ld_data.get("amenityFeature") or []
+                    if isinstance(raw_amenities, list):
+                        for item in raw_amenities:
+                            if isinstance(item, str):
+                                amenities.append(item)
+                            elif isinstance(item, dict):
+                                name = item.get("name") or item.get("value") or ""
+                                if name:
+                                    amenities.append(name)
+                    desc = ld_data.get("description") or ""
+                    if desc and isinstance(desc, str):
+                        description = desc.strip()
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                pass
+
+    return amenities, description
+
+
+async def _enrich_listings(listings: list[Listing]) -> list[Listing]:
+    """Enrich listings with amenities and descriptions from individual listing pages.
+
+    Uses Apify's cheerio-scraper actor to fetch listing pages through residential proxies
+    (direct HTTP to streeteasy.com returns 403 from Imperva).
+
+    Gracefully degrades: if enrichment fails for individual listings or entirely,
+    the pipeline continues with unenriched data.
+    """
+    if not listings:
+        return listings
+
+    token = os.environ.get("APIFY_API_TOKEN", "")
+    if not token:
+        logger.warning("No APIFY_API_TOKEN, skipping enrichment")
+        return listings
+
+    urls = []
+    url_to_listing: dict[str, Listing] = {}
+    for listing in listings:
+        if listing.url:
+            urls.append(listing.url)
+            url_to_listing[listing.url] = listing
+
+    if not urls:
+        return listings
+
+    logger.info("Enriching %d listings via Apify cheerio-scraper", len(urls))
+
+    try:
+        client = ApifyClientAsync(token=token)
+        run_input = {
+            "startUrls": [{"url": u} for u in urls],
+            "maxConcurrency": 3,
+            "maxRequestRetries": 2,
+            "pageFunction": """async function pageFunction(context) {
+                return {
+                    url: context.request.url,
+                    html: context.body,
+                };
+            }""",
+            "proxy": {
+                "useApifyProxy": True,
+                "apifyProxyGroups": ["RESIDENTIAL"],
+                "countryCode": "US",
+            },
+        }
+
+        run = await client.actor("apify/cheerio-scraper").call(
+            run_input=run_input,
+            timeout_secs=120,
+            memory_mbytes=512,
+        )
+
+        if not run or run.get("status") != "SUCCEEDED":
+            logger.warning("Enrichment actor run failed: %s", run)
+            return listings
+
+        dataset = client.dataset(run["defaultDatasetId"])
+        result = await dataset.list_items()
+
+        enriched_count = 0
+        for item in result.items:
+            page_url = item.get("url", "")
+            html = item.get("html", "")
+            if not html or page_url not in url_to_listing:
+                continue
+
+            listing = url_to_listing[page_url]
+            try:
+                page_amenities, page_description = _extract_listing_detail(html)
+                if page_amenities and not listing.amenities:
+                    listing.amenities = page_amenities
+                if page_description and not listing.description:
+                    listing.description = page_description
+                if page_amenities or page_description:
+                    enriched_count += 1
+            except Exception:
+                logger.debug("Failed to parse enrichment for %s", listing.listing_id)
+
+        logger.info("Enriched %d/%d listings with amenities/description", enriched_count, len(listings))
+
+    except Exception:
+        logger.exception("Listing enrichment failed, continuing with unenriched data")
+
+    return listings
 
 
 def _neighborhood_pre_filter(
@@ -301,6 +521,15 @@ async def _llm_score_listings(
             entry["avail"] = l.available_date
         if l.amenities:
             entry["amenities"] = l.amenities
+        if l.description:
+            entry["desc"] = l.description[:300]
+        if l.net_effective_price and l.net_effective_price != l.price:
+            entry["net_effective"] = l.net_effective_price
+            entry["months_free"] = l.months_free
+        # Phase 3: canonical neighborhood name for alias matches
+        canonical = NEIGHBORHOOD_ALIASES.get(l.neighborhood.lower())
+        if canonical:
+            entry["hood_canonical"] = canonical.title()
         listings_data.append(entry)
 
     # Format preferences
@@ -378,6 +607,12 @@ async def _llm_score_listings(
         "- 0-24: Poor match\n\n"
         "Be nuanced: a slightly over-budget listing in a perfect location can score well. "
         "Adjacent neighborhoods to preferred areas are good, not zero. "
+        "When 'hood_canonical' is provided, it means this listing's neighborhood is a "
+        "sub-area of the user's preferred neighborhood. Treat it as matching.\n"
+        "Use the amenities list and description to evaluate must-haves and nice-to-haves. "
+        "If amenities data is missing for a listing, do NOT penalize it — assume unknown.\n"
+        "When a listing has a net_effective price (from free months), use that for budget "
+        "comparison, not the gross price.\n"
         "Must-haves matter more than nice-to-haves. "
         "2-3 pros, 1-2 cons per listing. Return ONLY the JSON array."
     )
@@ -389,6 +624,7 @@ async def _llm_score_listings(
         response = await client.messages.create(
             model=SCORING_MODEL,
             max_tokens=8192,
+            temperature=0,
             messages=[{"role": "user", "content": prompt}],
         )
 
@@ -419,8 +655,31 @@ async def _llm_score_listings(
             scored_data = score_map.get(listing.listing_id)
             # If LLM omitted it, default to include=True
             llm_include = scored_data.get("include", True) if scored_data else True
-            if llm_include and (listing.match_score or 0) >= SCORE_FLOOR:
+            passes = llm_include and (listing.match_score or 0) >= SCORE_FLOOR
+            if passes:
                 included.append(listing)
+
+            # Per-listing decision logging
+            canonical = NEIGHBORHOOD_ALIASES.get(listing.neighborhood.lower())
+            hood_display = f"{listing.neighborhood}\u2192{canonical.title()}" if canonical else listing.neighborhood
+            decision = "INCLUDED" if passes else "EXCLUDED"
+            logger.info(
+                "Listing %s [%s, $%s, %s]: include=%s score=%s -> %s",
+                listing.listing_id,
+                hood_display,
+                f"{listing.price:,}",
+                listing.address,
+                llm_include,
+                listing.match_score,
+                decision,
+            )
+
+        logger.info(
+            "LLM scoring: %d/%d included (floor=%d)",
+            len(included),
+            len(listings),
+            SCORE_FLOOR,
+        )
 
         # Fallback: if all excluded, return top 3 by score
         if not included and listings:
@@ -525,6 +784,31 @@ async def _vision_pick_heroes(listings: list[Listing]) -> dict[str, str]:
     if not viable:
         return {}
 
+    # Batch viable listings to stay under Claude API's 100-image limit
+    # 12 listings × 8 photos = 96 images max per batch
+    MAX_LISTINGS_PER_BATCH = 12
+    viable_ids = list(viable.keys())
+    hero_map: dict[str, str] = {}
+
+    for batch_start in range(0, len(viable_ids), MAX_LISTINGS_PER_BATCH):
+        batch_ids = viable_ids[batch_start:batch_start + MAX_LISTINGS_PER_BATCH]
+        batch_viable = {lid: viable[lid] for lid in batch_ids}
+        batch_result = await _vision_pick_batch(batch_viable, listings)
+        hero_map.update(batch_result)
+
+    return hero_map
+
+
+async def _vision_pick_batch(
+    viable: dict[str, list[tuple[str, str, str]]],
+    listings: list[Listing],
+) -> dict[str, str]:
+    """Pick hero photos for a single batch of listings via vision API.
+
+    Args:
+        viable: {listing_id: [(key, letter, b64_data), ...]} — listings with 2+ photos
+        listings: full listing objects for address lookup
+    """
     # Build vision API message
     content_blocks: list[dict[str, Any]] = []
     # Track key mapping: {listing_id: {letter: key}}
