@@ -15,6 +15,9 @@ from src.scanner import (
     ScoringResult,
     _llm_score_listings,
     _neighborhood_pre_filter,
+    _pick_hero_photos,
+    _sample_photo_keys,
+    _vision_pick_heroes,
     scan_for_chat,
 )
 
@@ -562,6 +565,7 @@ class TestScanForChat:
 
         with (
             patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
@@ -628,6 +632,7 @@ class TestScanForChat:
 
         with (
             patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
@@ -660,6 +665,7 @@ class TestScanForChat:
 
         with (
             patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
@@ -714,6 +720,7 @@ class TestScanForChat:
 
         with (
             patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
@@ -752,6 +759,7 @@ class TestScanForChat:
 
         with (
             patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
@@ -804,6 +812,7 @@ class TestScanForChat:
 
         with (
             patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
@@ -838,6 +847,7 @@ class TestScanForChat:
 
         with (
             patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
@@ -851,3 +861,191 @@ class TestScanForChat:
             for call in mock_bot.send_text.call_args_list
         ]
         assert not any("None of these perfectly matched" in t for t in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_hero_photo_used_when_available(self):
+        """When hero picker returns a URL, it's used instead of photos[0]."""
+        state = self._make_state()
+
+        raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing(
+                "1",
+                neighborhood="Chelsea",
+                match_score=80,
+                photos=["http://original.jpg"],
+            ),
+        ]
+
+        hero_url = "http://hero-picked.jpg"
+
+        with (
+            patch("src.scanner.save_state"),
+            patch(
+                "src.scanner._pick_hero_photos",
+                new_callable=AsyncMock,
+                return_value={"1": hero_url},
+            ),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings),
+            ),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+        # Verify the hero photo URL was used
+        assert mock_bot.send_listing_photo.call_count == 1
+        call_kwargs = mock_bot.send_listing_photo.call_args
+        assert call_kwargs.kwargs.get("photo_url") or call_kwargs[1].get("photo_url") == hero_url
+
+
+# ---------------------------------------------------------------------------
+# D) Hero photo picker tests
+# ---------------------------------------------------------------------------
+
+
+class TestSamplePhotoKeys:
+    def test_fewer_than_max(self):
+        """Keys fewer than max returned as-is."""
+        keys = ["a", "b", "c"]
+        assert _sample_photo_keys(keys, max_count=8) == ["a", "b", "c"]
+
+    def test_exactly_max(self):
+        """Keys exactly at max returned as-is."""
+        keys = list("abcdefgh")
+        assert _sample_photo_keys(keys, max_count=8) == list("abcdefgh")
+
+    def test_more_than_max(self):
+        """More than max keys are sampled: first 3 + evenly spaced."""
+        keys = [str(i) for i in range(20)]
+        sampled = _sample_photo_keys(keys, max_count=8)
+        assert len(sampled) == 8
+        # First 3 are always the first 3
+        assert sampled[:3] == ["0", "1", "2"]
+
+    def test_empty(self):
+        assert _sample_photo_keys([]) == []
+
+
+class TestHeroPhotoPicker:
+    @pytest.mark.asyncio
+    async def test_successful_pick(self):
+        """Vision model picks are mapped back to full-size URLs."""
+        listings = [
+            _make_listing("1", photo_keys=["keyA", "keyB", "keyC"]),
+        ]
+
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text='{"1": "B"}')]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        # Mock httpx downloads
+        async def fake_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.content = b"\xff\xd8\xff\xe0fake-jpeg-data"
+            return resp
+
+        mock_http = AsyncMock()
+        mock_http.get = fake_get
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client),
+            patch("src.scanner.httpx.AsyncClient", return_value=mock_http),
+        ):
+            result = await _pick_hero_photos(listings)
+
+        assert "1" in result
+        assert "keyB" in result["1"]
+
+    @pytest.mark.asyncio
+    async def test_api_failure_returns_empty(self):
+        """API failure returns empty dict (graceful fallback)."""
+        listings = [
+            _make_listing("1", photo_keys=["keyA", "keyB"]),
+        ]
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(side_effect=Exception("API error"))
+
+        async def fake_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.content = b"\xff\xd8\xff\xe0fake"
+            return resp
+
+        mock_http = AsyncMock()
+        mock_http.get = fake_get
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client),
+            patch("src.scanner.httpx.AsyncClient", return_value=mock_http),
+        ):
+            result = await _pick_hero_photos(listings)
+
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_single_photo_skipped(self):
+        """Listings with fewer than 2 photo_keys are skipped."""
+        listings = [
+            _make_listing("1", photo_keys=["onlyOne"]),
+        ]
+        result = await _pick_hero_photos(listings)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_no_keys_skipped(self):
+        """Listings with no photo_keys are skipped."""
+        listings = [
+            _make_listing("1", photo_keys=[]),
+        ]
+        result = await _pick_hero_photos(listings)
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_invalid_letter_omitted(self):
+        """Invalid letter in vision response omits that listing from result."""
+        listings = [
+            _make_listing("1", photo_keys=["keyA", "keyB", "keyC"]),
+        ]
+
+        # Model returns letter "Z" which doesn't exist
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text='{"1": "Z"}')]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        async def fake_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.content = b"\xff\xd8\xff\xe0fake"
+            return resp
+
+        mock_http = AsyncMock()
+        mock_http.get = fake_get
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client),
+            patch("src.scanner.httpx.AsyncClient", return_value=mock_http),
+        ):
+            result = await _pick_hero_photos(listings)
+
+        # Letter "Z" doesn't map to any key, so listing "1" should be omitted
+        assert "1" not in result

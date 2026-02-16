@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
 import os
@@ -10,10 +12,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 import anthropic
+import httpx
 
 from src.formatter import format_listing_card, format_scan_header, listing_keyboard
 from src.models import MAX_RECENT_LISTINGS, ChatState, CurrentApartment, Listing, Preferences
-from src.apify_scraper import ApifyScraper
+from src.apify_scraper import ApifyScraper, STREETEASY_PHOTO_URL, STREETEASY_PHOTO_URL_THUMB
 from src.storage import load_all_states, save_state
 
 logger = logging.getLogger(__name__)
@@ -155,6 +158,9 @@ async def scan_for_chat(
     # Sort by score descending
     scored.sort(key=lambda l: l.match_score or 0, reverse=True)
 
+    # Pick hero photos via vision model (graceful fallback to photos[0])
+    hero_photos = await _pick_hero_photos(scored)
+
     # Store in recent_listings for later reference (details, compare, draft)
     for listing in scored:
         state.recent_listings[listing.listing_id] = listing
@@ -180,11 +186,12 @@ async def scan_for_chat(
             card_text = format_listing_card(listing, rank=i)
             keyboard = listing_keyboard(listing.listing_id, listing.url)
 
-            if listing.photos:
+            photo_url = hero_photos.get(listing.listing_id, listing.photos[0]) if listing.photos else None
+            if photo_url:
                 await telegram_bot.send_listing_photo(
                     state.chat_id,
                     listing_url=listing.url,
-                    photo_url=listing.photos[0],
+                    photo_url=photo_url,
                     caption=card_text,
                     keyboard=keyboard,
                 )
@@ -212,6 +219,7 @@ def _parse_listing(raw: dict) -> Listing:
         sqft=raw.get("sqft"),
         amenities=raw.get("amenities", []),
         photos=raw.get("photos", []),
+        photo_keys=raw.get("photo_keys", []),
         broker_fee=raw.get("broker_fee"),
         available_date=raw.get("available_date"),
         description=raw.get("description"),
@@ -428,3 +436,155 @@ async def _llm_score_listings(
         # Sort by price as fallback when scoring fails
         listings.sort(key=lambda l: l.price)
         return ScoringResult(listings=listings)
+
+
+# ---------------------------------------------------------------------------
+# Vision hero photo picker
+# ---------------------------------------------------------------------------
+
+
+def _sample_photo_keys(keys: list[str], max_count: int = 8) -> list[str]:
+    """Sample up to max_count keys: first 3 + evenly spaced from remainder."""
+    if len(keys) <= max_count:
+        return list(keys)
+    first = keys[:3]
+    remaining = keys[3:]
+    need = max_count - len(first)
+    step = max(1, len(remaining) // need)
+    sampled = [remaining[i * step] for i in range(need) if i * step < len(remaining)]
+    return first + sampled[:need]
+
+
+async def _download_photo(client: httpx.AsyncClient, url: str) -> tuple[str, bytes | None]:
+    """Download a single photo, return (url, bytes | None)."""
+    try:
+        resp = await client.get(url, timeout=10.0, headers={"Referer": "https://streeteasy.com/"})
+        if resp.status_code == 200 and resp.content:
+            return (url, resp.content)
+    except Exception:
+        pass
+    return (url, None)
+
+
+async def _pick_hero_photos(listings: list[Listing]) -> dict[str, str]:
+    """Pick the best hero photo for each listing using vision model.
+
+    Returns dict mapping listing_id → best photo full-size URL.
+    Returns {} on any failure (graceful fallback to photos[0]).
+    """
+    try:
+        candidates = [l for l in listings if len(l.photo_keys) >= 2]
+        if not candidates:
+            return {}
+        return await _vision_pick_heroes(candidates)
+    except Exception:
+        logger.exception("Hero photo picker failed, falling back to first photo")
+        return {}
+
+
+async def _vision_pick_heroes(listings: list[Listing]) -> dict[str, str]:
+    """Core vision logic: download thumbnails, ask model to pick best hero photo."""
+    # Build download tasks: {listing_id: [(key, thumb_url), ...]}
+    download_plan: dict[str, list[tuple[str, str]]] = {}
+    for listing in listings:
+        sampled = _sample_photo_keys(listing.photo_keys)
+        download_plan[listing.listing_id] = [
+            (key, STREETEASY_PHOTO_URL_THUMB.format(key=key)) for key in sampled
+        ]
+
+    # Download all thumbnails in parallel with semaphore
+    sem = asyncio.Semaphore(20)
+    all_urls: list[tuple[str, str, str]] = []  # (listing_id, key, url)
+    for lid, pairs in download_plan.items():
+        for key, url in pairs:
+            all_urls.append((lid, key, url))
+
+    async with httpx.AsyncClient() as client:
+        async def _bounded_download(url: str) -> tuple[str, bytes | None]:
+            async with sem:
+                return await _download_photo(client, url)
+
+        results = await asyncio.gather(
+            *[_bounded_download(url) for _, _, url in all_urls]
+        )
+
+    # Organize downloaded photos by listing
+    # {listing_id: [(key, letter, b64_data), ...]}
+    photos_by_listing: dict[str, list[tuple[str, str, str]]] = {}
+    for (lid, key, url), (_, data) in zip(all_urls, results):
+        if data is None:
+            continue
+        if lid not in photos_by_listing:
+            photos_by_listing[lid] = []
+        letter = chr(ord("A") + len(photos_by_listing[lid]))
+        b64 = base64.standard_b64encode(data).decode("ascii")
+        photos_by_listing[lid].append((key, letter, b64))
+
+    # Need at least one listing with 2+ successfully downloaded photos
+    viable = {lid: photos for lid, photos in photos_by_listing.items() if len(photos) >= 2}
+    if not viable:
+        return {}
+
+    # Build vision API message
+    content_blocks: list[dict[str, Any]] = []
+    # Track key mapping: {listing_id: {letter: key}}
+    letter_to_key: dict[str, dict[str, str]] = {}
+
+    for lid, photos in viable.items():
+        listing = next(l for l in listings if l.listing_id == lid)
+        content_blocks.append({
+            "type": "text",
+            "text": f"Listing {lid} — {listing.address}:",
+        })
+        letter_to_key[lid] = {}
+        for key, letter, b64 in photos:
+            letter_to_key[lid][letter] = key
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+            })
+            content_blocks.append({
+                "type": "text",
+                "text": f"  Photo {letter}",
+            })
+
+    listing_ids_str = ", ".join(viable.keys())
+    content_blocks.append({
+        "type": "text",
+        "text": (
+            f"\nFor each listing ({listing_ids_str}), pick the single best hero photo "
+            "for a Telegram apartment card. Prefer wide-angle living room or main space shots. "
+            "Avoid bathrooms, floor plans, building exteriors, and hallways.\n\n"
+            'Return ONLY a JSON object mapping listing_id to the chosen photo letter, e.g.: '
+            '{"4961650": "C", "4961651": "A"}'
+        ),
+    })
+
+    client = anthropic.AsyncAnthropic(
+        api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+    )
+    response = await client.messages.create(
+        model=SCORING_MODEL,
+        max_tokens=1024,
+        system="You are a photo selector for apartment listings. Return ONLY valid JSON.",
+        messages=[{"role": "user", "content": content_blocks}],
+    )
+
+    text = response.content[0].text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        text = text.rsplit("```", 1)[0].strip()
+
+    picks = json.loads(text)
+
+    # Map letter picks back to full-size URLs
+    hero_map: dict[str, str] = {}
+    for lid, letter in picks.items():
+        if lid not in letter_to_key:
+            continue
+        letter_upper = str(letter).upper()
+        key = letter_to_key[lid].get(letter_upper)
+        if key:
+            hero_map[lid] = STREETEASY_PHOTO_URL.format(key=key)
+
+    return hero_map

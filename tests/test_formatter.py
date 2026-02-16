@@ -194,16 +194,19 @@ class TestScanHeader:
     def test_no_results(self):
         header = format_scan_header(0)
         assert "No new listings" in header
+        assert "ranked" not in header
 
     def test_one_result(self):
         header = format_scan_header(1)
         assert "1" in header
         assert "listing" in header
+        assert "ranked" in header
 
     def test_multiple_results(self):
         header = format_scan_header(5)
         assert "5" in header
         assert "listings" in header
+        assert "ranked" in header
 
 
 class TestKeyboards:

@@ -164,7 +164,7 @@ def format_scan_header(count: int) -> str:
     return (
         f"🔍 <b>Daily Scan Complete</b>\n\n"
         f"Found <b>{count}</b> new listing{'s' if count != 1 else ''} "
-        f"matching your preferences:"
+        f"matching your preferences, ranked by match score:"
     )
 
 

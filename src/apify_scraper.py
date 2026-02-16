@@ -109,7 +109,8 @@ def _build_streeteasy_url(prefs: Preferences) -> str:
     return url
 
 
-STREETEASY_PHOTO_URL = "https://streeteasy.imgix.net/image/{key}/image.jpg"
+STREETEASY_PHOTO_URL = "https://photos.zillowstatic.com/fp/{key}-se_large_800_400.jpg"
+STREETEASY_PHOTO_URL_THUMB = "https://photos.zillowstatic.com/fp/{key}-se_medium_500_250.jpg"
 
 
 def _map_apify_item(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -132,12 +133,14 @@ def _map_apify_item(item: dict[str, Any]) -> dict[str, Any] | None:
     unit = node.get("unit", "")
     address = f"{street} #{unit}".strip(" #") if street else f"Listing {listing_id}"
 
-    # Photos: array of {"key": "abc123"} -> full image URLs
+    # Photos: array of {"key": "abc123"} -> full image URLs + raw keys
     photos = []
+    photo_keys = []
     for photo in node.get("photos") or []:
         key = photo.get("key") if isinstance(photo, dict) else None
         if key:
             photos.append(STREETEASY_PHOTO_URL.format(key=key))
+            photo_keys.append(key)
 
     # Bathrooms: full + half
     full_bath = int(node.get("fullBathroomCount", 0) or 0)
@@ -158,6 +161,7 @@ def _map_apify_item(item: dict[str, Any]) -> dict[str, Any] | None:
         "bathrooms": bathrooms,
         "sqft": sqft,
         "photos": photos,
+        "photo_keys": photo_keys,
         "available_date": node.get("availableAt"),
         "broker_fee": None if node.get("noFee", False) else "Broker fee",
     }

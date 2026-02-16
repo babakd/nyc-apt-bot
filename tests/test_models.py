@@ -116,6 +116,43 @@ class TestListing:
         assert listing.match_score == 100
 
 
+class TestPhotoKeys:
+    def test_defaults_to_empty(self):
+        """photo_keys defaults to empty list."""
+        listing = Listing(
+            listing_id="1",
+            url="",
+            address="",
+            neighborhood="",
+            price=1000,
+            bedrooms=1,
+            bathrooms=1,
+        )
+        assert listing.photo_keys == []
+
+    def test_json_roundtrip(self):
+        """photo_keys survives JSON serialization."""
+        listing = Listing(
+            listing_id="1",
+            url="https://streeteasy.com/rental/1",
+            address="100 Main St",
+            neighborhood="Chelsea",
+            price=3500,
+            bedrooms=2,
+            bathrooms=1.0,
+            photo_keys=["abc123", "def456"],
+        )
+        data = listing.model_dump_json()
+        restored = Listing.model_validate_json(data)
+        assert restored.photo_keys == ["abc123", "def456"]
+
+    def test_backward_compatibility(self):
+        """Old JSON without photo_keys loads correctly."""
+        old_json = '{"listing_id": "1", "url": "", "address": "", "neighborhood": "", "price": 1000, "bedrooms": 1, "bathrooms": 1}'
+        listing = Listing.model_validate_json(old_json)
+        assert listing.photo_keys == []
+
+
 class TestDraft:
     def test_draft_creation(self):
         draft = Draft(

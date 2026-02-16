@@ -48,6 +48,7 @@ class Listing(BaseModel):
     sqft: Optional[int] = None
     amenities: list[str] = Field(default_factory=list)
     photos: list[str] = Field(default_factory=list, description="Photo URLs")
+    photo_keys: list[str] = Field(default_factory=list, description="Raw photo keys for CDN URL construction")
     broker_fee: Optional[str] = None
     available_date: Optional[str] = None
     description: Optional[str] = None
