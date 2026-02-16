@@ -79,12 +79,13 @@ async def create_draft(
             if apt.cons:
                 prompt += f"Looking to improve: {', '.join(apt.cons)}\n"
 
-        message_text = await claude.chat(
+        result = await claude.chat(
             system=DRAFT_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
             tools=[],
             tool_handler=_noop_tool_handler,
         )
+        message_text = result.text
     except Exception:
         logger.exception("Failed to generate draft via Claude API, using template")
         message_text = ""
@@ -136,12 +137,13 @@ async def revise_draft(
             f"User feedback:\n{feedback}\n\n"
             f"Please revise the message based on the feedback."
         )
-        revised = await claude.chat(
+        result = await claude.chat(
             system=REVISE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
             tools=[],
             tool_handler=_noop_tool_handler,
         )
+        revised = result.text
     except Exception:
         logger.exception("Failed to revise draft via Claude API")
         await telegram_bot.send_text(

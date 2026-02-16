@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from src.models import ChatState, Draft
 from src.telegram_handler import TelegramBot
 
 
@@ -103,6 +104,7 @@ class TestGroupMessageFiltering:
 
         mock_state = AsyncMock()
         mock_state.is_group = False
+        mock_state.pending_draft_edit = None
 
         with patch("src.telegram_handler.load_state") as mock_load, \
              patch("src.telegram_handler.save_state"), \
@@ -137,6 +139,7 @@ class TestGroupMessageFiltering:
 
         mock_state = AsyncMock()
         mock_state.is_group = True
+        mock_state.pending_draft_edit = None
 
         with patch("src.telegram_handler.load_state") as mock_load, \
              patch("src.telegram_handler.save_state"), \
@@ -165,6 +168,7 @@ class TestGroupMessageFiltering:
 
         mock_state = AsyncMock()
         mock_state.is_group = False
+        mock_state.pending_draft_edit = None
 
         with patch("src.telegram_handler.load_state") as mock_load, \
              patch("src.telegram_handler.save_state"), \
@@ -225,3 +229,127 @@ class TestBotAddedToGroup:
             welcome_text = bot.send_text.call_args[0][1]
             assert "apartment hunting assistant" in welcome_text
             assert "@test_bot" in welcome_text
+
+
+class TestDraftEditCallback:
+    @pytest.mark.asyncio
+    async def test_edit_callback_stores_pending_draft_edit(self, bot):
+        """Edit callback stores pending_draft_edit and saves state."""
+        state = ChatState(chat_id=123)
+        draft = Draft(draft_id="d1", listing_id="100", message_text="Hello")
+        state.active_drafts["d1"] = draft
+
+        callback = {
+            "id": "cb1",
+            "message": {"chat": {"id": 123}, "message_id": 1},
+            "data": "draft_edit:d1",
+        }
+
+        with patch("src.telegram_handler.load_state", return_value=state), \
+             patch("src.telegram_handler.save_state") as mock_save:
+            bot.send_text = AsyncMock(return_value={"ok": True})
+            bot._answer_callback = AsyncMock()
+
+            await bot._handle_callback_query(callback)
+
+            assert state.pending_draft_edit == "d1"
+            mock_save.assert_called_once_with(state)
+            bot.send_text.assert_called_once()
+            sent_text = bot.send_text.call_args[0][1]
+            assert "What would you like to change" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_edit_callback_nonexistent_draft(self, bot):
+        """Edit callback on non-existent draft shows error."""
+        state = ChatState(chat_id=123)
+
+        callback = {
+            "id": "cb1",
+            "message": {"chat": {"id": 123}, "message_id": 1},
+            "data": "draft_edit:nonexistent",
+        }
+
+        with patch("src.telegram_handler.load_state", return_value=state), \
+             patch("src.telegram_handler.save_state"):
+            bot.send_text = AsyncMock(return_value={"ok": True})
+            bot._answer_callback = AsyncMock()
+
+            await bot._handle_callback_query(callback)
+
+            assert state.pending_draft_edit is None
+            bot.send_text.assert_called_once()
+            sent_text = bot.send_text.call_args[0][1]
+            assert "no longer available" in sent_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_edit_callback_non_pending_draft(self, bot):
+        """Edit callback on sent draft shows error."""
+        state = ChatState(chat_id=123)
+        draft = Draft(draft_id="d1", listing_id="100", message_text="Hello", status="sent")
+        state.active_drafts["d1"] = draft
+
+        callback = {
+            "id": "cb1",
+            "message": {"chat": {"id": 123}, "message_id": 1},
+            "data": "draft_edit:d1",
+        }
+
+        with patch("src.telegram_handler.load_state", return_value=state), \
+             patch("src.telegram_handler.save_state"):
+            bot.send_text = AsyncMock(return_value={"ok": True})
+            bot._answer_callback = AsyncMock()
+
+            await bot._handle_callback_query(callback)
+
+            assert state.pending_draft_edit is None
+            bot.send_text.assert_called_once()
+            sent_text = bot.send_text.call_args[0][1]
+            assert "no longer available" in sent_text.lower()
+
+
+class TestDraftEditMessageRouting:
+    @pytest.mark.asyncio
+    async def test_next_message_routes_to_revise_draft(self, bot):
+        """Next message after Edit callback routes to revise_draft and clears field."""
+        state = ChatState(chat_id=123)
+        state.pending_draft_edit = "d1"
+
+        message = {
+            "chat": {"id": 123, "type": "private"},
+            "from": {"first_name": "Alice"},
+            "text": "make it more casual",
+        }
+
+        with patch("src.telegram_handler.load_state", return_value=state) as mock_load, \
+             patch("src.telegram_handler.save_state") as mock_save, \
+             patch("src.outreach.revise_draft", new_callable=AsyncMock) as mock_revise:
+            await bot._handle_message(message)
+
+            # pending_draft_edit should be cleared
+            assert state.pending_draft_edit is None
+            mock_save.assert_called_once_with(state)
+            mock_revise.assert_called_once_with(bot, 123, "d1", "make it more casual")
+
+    @pytest.mark.asyncio
+    async def test_revise_draft_error_sends_message(self, bot):
+        """If revise_draft raises, error message is sent and field is cleared."""
+        state = ChatState(chat_id=123)
+        state.pending_draft_edit = "d1"
+
+        message = {
+            "chat": {"id": 123, "type": "private"},
+            "from": {"first_name": "Alice"},
+            "text": "make it shorter",
+        }
+
+        with patch("src.telegram_handler.load_state", return_value=state), \
+             patch("src.telegram_handler.save_state"), \
+             patch("src.outreach.revise_draft", new_callable=AsyncMock, side_effect=Exception("fail")):
+            bot.send_text = AsyncMock(return_value={"ok": True})
+
+            await bot._handle_message(message)
+
+            assert state.pending_draft_edit is None
+            bot.send_text.assert_called_once()
+            sent_text = bot.send_text.call_args[0][1]
+            assert "Failed to revise" in sent_text

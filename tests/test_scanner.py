@@ -12,6 +12,7 @@ from src.models import ChatState, CurrentApartment, Listing, Preferences
 from src.scanner import (
     NEIGHBORHOOD_ALIASES,
     SCORE_FLOOR,
+    ScoringResult,
     _llm_score_listings,
     _neighborhood_pre_filter,
     scan_for_chat,
@@ -184,10 +185,12 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert len(result) == 1
         assert result[0].listing_id == "1"
+        assert scoring_result.is_fallback is False
 
     @pytest.mark.asyncio
     async def test_soft_constraint_scoring(self):
@@ -207,7 +210,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert len(result) == 3
         # Verify scores assigned correctly
@@ -232,7 +236,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert len(result) == 1
         assert result[0].listing_id == "1"
@@ -251,7 +256,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert len(result) == 1
         assert result[0].match_score == SCORE_FLOOR
@@ -271,7 +277,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
             # Verify the prompt sent to Claude contains constraint_context
             call_kwargs = mock_client.messages.create.call_args
@@ -292,7 +299,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert len(result) == 2
         # Verify constraint_context text is NOT in the prompt
@@ -319,7 +327,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert len(result) == 3
         omitted = [l for l in result if l.listing_id == "2"][0]
@@ -341,7 +350,8 @@ class TestLLMScoring:
         )
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         # All listings returned
         assert len(result) == 3
@@ -363,7 +373,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(mock_response)
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert len(result) == 2
         prices = [l.price for l in result]
@@ -391,13 +402,16 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         # Exactly 3 returned (top 3 by score)
         assert len(result) == 3
         result_ids = {l.listing_id for l in result}
         # Top 3 scores: listing 3 (50), listing 1 (40), listing 2 (35)
         assert result_ids == {"1", "2", "3"}
+        # Fallback flag must be set
+        assert scoring_result.is_fallback is True
 
     @pytest.mark.asyncio
     async def test_pros_cons_assigned(self):
@@ -417,7 +431,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert result[0].pros == ["great location", "no fee", "laundry"]
         # Cons are capped at 2
@@ -436,7 +451,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         score_by_id = {l.listing_id: l.match_score for l in result}
         assert score_by_id["1"] == 100
@@ -461,7 +477,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(mock_response)
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs)
+            scoring_result = await _llm_score_listings(listings, prefs)
+            result = scoring_result.listings
 
         assert len(result) == 1
         assert result[0].match_score == 75
@@ -470,8 +487,9 @@ class TestLLMScoring:
     async def test_empty_listings_returns_empty(self):
         """Empty listing input returns empty without calling LLM."""
         prefs = Preferences(budget_max=4000)
-        result = await _llm_score_listings([], prefs)
-        assert result == []
+        scoring_result = await _llm_score_listings([], prefs)
+        assert scoring_result.listings == []
+        assert scoring_result.is_fallback is False
 
     @pytest.mark.asyncio
     async def test_current_apartment_in_prompt(self):
@@ -491,7 +509,8 @@ class TestLLMScoring:
         mock_client = _mock_anthropic_client(_mock_llm_response(scores))
 
         with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await _llm_score_listings(listings, prefs, current_apt)
+            scoring_result = await _llm_score_listings(listings, prefs, current_apt)
+            result = scoring_result.listings
 
             call_kwargs = mock_client.messages.create.call_args
             messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
@@ -546,7 +565,7 @@ class TestScanForChat:
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
-                return_value=scored_listings,
+                return_value=ScoringResult(listings=scored_listings),
             ) as mock_llm,
         ):
             await scan_for_chat(mock_scraper, mock_bot, state)
@@ -612,7 +631,7 @@ class TestScanForChat:
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
-                return_value=scored_listings,
+                return_value=ScoringResult(listings=scored_listings),
             ),
         ):
             await scan_for_chat(mock_scraper, mock_bot, state)
@@ -644,7 +663,7 @@ class TestScanForChat:
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
-                return_value=scored_listings,
+                return_value=ScoringResult(listings=scored_listings),
             ),
         ):
             await scan_for_chat(mock_scraper, mock_bot, state)
@@ -698,7 +717,7 @@ class TestScanForChat:
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
-                return_value=scored_listings,
+                return_value=ScoringResult(listings=scored_listings),
             ) as mock_llm,
         ):
             await scan_for_chat(mock_scraper, mock_bot, state)
@@ -736,7 +755,7 @@ class TestScanForChat:
             patch(
                 "src.scanner._llm_score_listings",
                 new_callable=AsyncMock,
-                return_value=scored_listings,
+                return_value=ScoringResult(listings=scored_listings),
             ),
         ):
             await scan_for_chat(mock_scraper, mock_bot, state)
@@ -764,3 +783,71 @@ class TestScanForChat:
         mock_bot.send_text.assert_called_once()
         sent_text = mock_bot.send_text.call_args[0][1]
         assert "trouble searching StreetEasy" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_fallback_caveat_sent(self):
+        """When scoring result is_fallback=True, caveat message is sent."""
+        state = self._make_state()
+
+        raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing("1", neighborhood="Chelsea", match_score=40, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings, is_fallback=True),
+            ),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        assert any("None of these perfectly matched" in t for t in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_no_caveat_when_not_fallback(self):
+        """When scoring result is_fallback=False, no caveat message is sent."""
+        state = self._make_state()
+
+        raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_streeteasy = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing("1", neighborhood="Chelsea", match_score=80, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings, is_fallback=False),
+            ),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        assert not any("None of these perfectly matched" in t for t in sent_texts)

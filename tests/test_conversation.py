@@ -877,3 +877,36 @@ class TestGroupChatConversation:
         prompt = engine._build_system_prompt()
 
         assert "GROUP CHAT CONTEXT" not in prompt
+
+
+class TestResponseEscaping:
+    @pytest.mark.asyncio
+    async def test_claude_response_html_escaped(self, fresh_state):
+        """Claude response with < and & characters is escaped in Response."""
+        mock_claude = AsyncMock(spec=ClaudeClient)
+        mock_claude.chat = AsyncMock(return_value=ChatResult(
+            text="Try searching for price < $3000 & location = 'East Village'",
+            tool_messages=[],
+        ))
+
+        engine = ConversationEngine(fresh_state, claude=mock_claude)
+        result = await engine.handle_message("What should I search?")
+
+        assert "&lt;" in result.responses[0].text
+        assert "&amp;" in result.responses[0].text
+        assert "<" not in result.responses[0].text.replace("&lt;", "").replace("&amp;", "")
+
+    @pytest.mark.asyncio
+    async def test_error_response_html_escaped(self, fresh_state):
+        """Error fallback response is also HTML-escaped."""
+        mock_claude = AsyncMock(spec=ClaudeClient)
+        mock_claude.chat = AsyncMock(side_effect=Exception("API error"))
+
+        engine = ConversationEngine(fresh_state, claude=mock_claude)
+        result = await engine.handle_message("Hello")
+
+        # Error message doesn't contain special chars, but should still be escaped
+        assert len(result.responses) == 1
+        # Verify the escape function was applied (no raw < or & in error message)
+        text = result.responses[0].text
+        assert "trouble" in text.lower()

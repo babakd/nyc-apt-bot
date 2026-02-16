@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 SCORING_MODEL = "claude-opus-4-6"
 SCORE_FLOOR = 25
+
+
+@dataclass
+class ScoringResult:
+    """Result from LLM scoring, with fallback flag."""
+    listings: list[Listing]
+    is_fallback: bool = False
 
 # Neighborhood alias map: StreetEasy naming variants → canonical preference name.
 # Used by _neighborhood_pre_filter to match listings whose neighborhood names
@@ -141,7 +149,8 @@ async def scan_for_chat(
         return
 
     # Layer 2: LLM filter + score
-    scored = await _llm_score_listings(filtered, prefs, state.current_apartment)
+    scoring_result = await _llm_score_listings(filtered, prefs, state.current_apartment)
+    scored = scoring_result.listings
 
     # Sort by score descending
     scored.sort(key=lambda l: l.match_score or 0, reverse=True)
@@ -160,6 +169,12 @@ async def scan_for_chat(
         await telegram_bot.send_text(state.chat_id, format_scan_header(0))
     else:
         await telegram_bot.send_text(state.chat_id, format_scan_header(len(scored)))
+
+        if scoring_result.is_fallback:
+            await telegram_bot.send_text(
+                state.chat_id,
+                "\u26a0\ufe0f None of these perfectly matched your criteria, but here are the closest options.",
+            )
 
         for i, listing in enumerate(scored, 1):
             card_text = format_listing_card(listing, rank=i)
@@ -244,7 +259,7 @@ async def _llm_score_listings(
     listings: list[Listing],
     prefs: Preferences,
     current_apartment: CurrentApartment | None = None,
-) -> list[Listing]:
+) -> ScoringResult:
     """Score and filter listings using Claude.
 
     Two-step process:
@@ -258,7 +273,7 @@ async def _llm_score_listings(
     If all listings are excluded, returns top 3 by score as fallback.
     """
     if not listings:
-        return listings
+        return ScoringResult(listings=listings)
 
     # Format listings compactly
     listings_data = []
@@ -404,11 +419,12 @@ async def _llm_score_listings(
             listings.sort(key=lambda l: l.match_score or 0, reverse=True)
             included = listings[:3]
             logger.info("All listings excluded by LLM filter, returning top 3 as fallback")
+            return ScoringResult(listings=included, is_fallback=True)
 
-        return included
+        return ScoringResult(listings=included)
 
     except Exception:
         logger.exception("LLM scoring failed, returning listings unscored")
         # Sort by price as fallback when scoring fails
         listings.sort(key=lambda l: l.price)
-        return listings
+        return ScoringResult(listings=listings)

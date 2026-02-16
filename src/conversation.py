@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.claude_client import ChatResult, ClaudeClient
-from src.formatter import format_preferences_summary
+from src.formatter import _escape_html, format_preferences_summary
 from src.models import ChatState, ConversationTurn, CurrentApartment, Preferences
 
 logger = logging.getLogger(__name__)
@@ -455,7 +455,7 @@ class ConversationEngine:
         # Trim history with boundary awareness
         self._trim_history()
 
-        result.responses.append(Response(text=response_text))
+        result.responses.append(Response(text=_escape_html(response_text)))
         return result
 
     def _build_messages(self) -> list[dict[str, Any]]:

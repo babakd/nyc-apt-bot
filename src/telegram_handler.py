@@ -60,7 +60,8 @@ class TelegramBot:
             if result and result.get("ok"):
                 self._bot_username = result["result"].get("username", "")
             else:
-                self._bot_username = ""
+                logger.warning("getMe failed, will retry on next call")
+                return ""
         return self._bot_username
 
     @staticmethod
@@ -134,6 +135,20 @@ class TelegramBot:
         state = load_state(chat_id)
         if is_group and not state.is_group:
             state.is_group = True
+
+        # Check for pending draft edit — route to revise_draft directly
+        if state.pending_draft_edit:
+            draft_id = state.pending_draft_edit
+            state.pending_draft_edit = None
+            save_state(state)
+            try:
+                from src.outreach import revise_draft
+                await revise_draft(self, chat_id, draft_id, text)
+            except Exception:
+                logger.exception("Draft revision failed")
+                await self.send_text(chat_id, "⚠️ Failed to revise the draft. Please try again.")
+            return
+
         engine = ConversationEngine(state)
         result = await engine.handle_message(text, sender_name=sender_name)
 
@@ -221,6 +236,13 @@ class TelegramBot:
 
         if data.startswith("draft_edit:"):
             draft_id = data.split(":", 1)[1]
+            # Validate draft exists and is pending
+            draft = state.active_drafts.get(draft_id)
+            if not draft or draft.status != "pending":
+                await self.send_text(chat_id, "This draft is no longer available for editing.")
+                return
+            state.pending_draft_edit = draft_id
+            save_state(state)
             await self.send_text(chat_id, "✏️ What would you like to change? Send me your feedback.")
             return
 

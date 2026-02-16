@@ -94,6 +94,7 @@ class ChatState(BaseModel):
     liked_listings: dict[str, Listing] = Field(default_factory=dict)
     recent_listings: dict[str, Listing] = Field(default_factory=dict)
     active_drafts: dict[str, Draft] = Field(default_factory=dict)
+    pending_draft_edit: Optional[str] = Field(None)
     current_apartment: Optional[CurrentApartment] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -7,6 +7,7 @@ import logging
 import os
 
 import modal
+from starlette.requests import Request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -70,8 +71,16 @@ class TelegramWebhook:
             logger.exception("Error during shutdown")
 
     @modal.fastapi_endpoint(method="POST")
-    async def webhook(self, data: dict):
+    async def webhook(self, request: Request, data: dict):
         """Receive Telegram webhook POST. Returns 200 immediately, processes async."""
+        # Verify webhook secret if configured
+        expected_secret = os.environ.get("SE_WEBHOOK_SECRET", "")
+        if expected_secret:
+            provided_secret = request.headers.get("x-telegram-bot-api-secret-token", "")
+            if provided_secret != expected_secret:
+                logger.warning("Webhook auth failed: invalid secret token")
+                return {"ok": False}
+
         logger.info("Received webhook update: %s", json.dumps(data)[:200])
 
         # Process the update — conversation engine handles everything
@@ -80,6 +89,8 @@ class TelegramWebhook:
             await self.bot.process_update(data)
         except Exception:
             logger.exception("Error processing webhook update")
+        finally:
+            volume.commit()
 
         return {"ok": True}
 
@@ -151,22 +162,32 @@ async def send_agent_message(
 
 # --- Setup Helper ---
 
-@app.local_entrypoint()
-def setup():
-    """Local helper to set up the Telegram webhook."""
+@app.function(image=image, secrets=secrets)
+def _setup_webhook(webhook_url: str):
+    """Set up the Telegram webhook (runs on Modal with access to secrets)."""
     import httpx
 
-    token = os.environ.get("SE_TELEGRAM_BOT_TOKEN")
-    if not token:
-        print("Set SE_TELEGRAM_BOT_TOKEN environment variable first")
-        return
-
-    # Get the webhook URL from Modal
-    webhook_url = TelegramWebhook.webhook.web_url
+    token = os.environ["SE_TELEGRAM_BOT_TOKEN"]
     print(f"Setting Telegram webhook to: {webhook_url}")
+
+    webhook_payload = {"url": webhook_url}
+    webhook_secret = os.environ.get("SE_WEBHOOK_SECRET", "")
+    if webhook_secret:
+        webhook_payload["secret_token"] = webhook_secret
+        print("Including secret_token in webhook registration")
 
     resp = httpx.post(
         f"https://api.telegram.org/bot{token}/setWebhook",
-        json={"url": webhook_url},
+        json=webhook_payload,
     )
     print(f"Response: {resp.json()}")
+
+
+@app.local_entrypoint()
+def setup():
+    """Set up the Telegram webhook. Run after 'modal deploy modal_app.py'."""
+    webhook_url = TelegramWebhook().webhook.web_url
+    # modal run creates -dev URLs; strip the -dev suffix to use production URL
+    webhook_url = webhook_url.replace("-dev.modal.run", ".modal.run")
+    print(f"Resolved webhook URL: {webhook_url}")
+    _setup_webhook.remote(webhook_url)

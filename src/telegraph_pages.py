@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from html import escape as _esc
 from typing import Optional
 
 from src.models import Listing
@@ -44,45 +45,45 @@ async def create_listing_page(listing: Listing) -> Optional[str]:
 
     # Photos (up to 8)
     for url in listing.photos[:8]:
-        html_parts.append(f'<img src="{url}"/>')
+        html_parts.append(f'<img src="{_esc(url, quote=True)}"/>')
 
     # Key details
     beds = "Studio" if listing.bedrooms == 0 else f"{listing.bedrooms} BR"
-    fee = "No fee" if not listing.broker_fee else listing.broker_fee
+    fee = "No fee" if not listing.broker_fee else _esc(listing.broker_fee)
     html_parts.append(
         f"<p><strong>${listing.price:,}/mo</strong> · {beds} · {listing.bathrooms} BA · {fee}</p>"
     )
-    html_parts.append(f"<p>{listing.neighborhood}</p>")
+    html_parts.append(f"<p>{_esc(listing.neighborhood)}</p>")
 
     if listing.sqft:
         html_parts.append(f"<p>{listing.sqft:,} sqft</p>")
 
     if listing.available_date:
-        html_parts.append(f"<p>Available: {listing.available_date}</p>")
+        html_parts.append(f"<p>Available: {_esc(listing.available_date)}</p>")
 
     if listing.match_score is not None:
         html_parts.append(f"<p>Match score: {listing.match_score}/100</p>")
 
     # Pros/cons
     if listing.pros:
-        items = "".join(f"<li>{p}</li>" for p in listing.pros)
+        items = "".join(f"<li>{_esc(p)}</li>" for p in listing.pros)
         html_parts.append(f"<h4>Pros</h4><ul>{items}</ul>")
     if listing.cons:
-        items = "".join(f"<li>{c}</li>" for c in listing.cons)
+        items = "".join(f"<li>{_esc(c)}</li>" for c in listing.cons)
         html_parts.append(f"<h4>Cons</h4><ul>{items}</ul>")
 
     # Description
     if listing.description:
-        html_parts.append(f"<h4>Description</h4><p>{listing.description}</p>")
+        html_parts.append(f"<h4>Description</h4><p>{_esc(listing.description)}</p>")
 
     # Amenities
     if listing.amenities:
-        items = "".join(f"<li>{a}</li>" for a in listing.amenities)
+        items = "".join(f"<li>{_esc(a)}</li>" for a in listing.amenities)
         html_parts.append(f"<h4>Amenities</h4><ul>{items}</ul>")
 
     # StreetEasy link
     if listing.url:
-        html_parts.append(f'<p><a href="{listing.url}">View on StreetEasy</a></p>')
+        html_parts.append(f'<p><a href="{_esc(listing.url, quote=True)}">View on StreetEasy</a></p>')
 
     try:
         page = await telegraph.create_page(

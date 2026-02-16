@@ -255,6 +255,27 @@ class TestChatState:
         assert restored.current_apartment.pros == ["quiet"]
 
 
+class TestPendingDraftEdit:
+    def test_defaults_to_none(self):
+        """pending_draft_edit defaults to None."""
+        state = ChatState(chat_id=12345)
+        assert state.pending_draft_edit is None
+
+    def test_json_roundtrip(self):
+        """pending_draft_edit survives JSON serialization."""
+        state = ChatState(chat_id=12345)
+        state.pending_draft_edit = "draft_abc"
+        data = state.model_dump_json()
+        restored = ChatState.model_validate_json(data)
+        assert restored.pending_draft_edit == "draft_abc"
+
+    def test_backward_compatibility(self):
+        """Old JSON without pending_draft_edit loads with None."""
+        old_json = '{"chat_id": 12345}'
+        state = ChatState.model_validate_json(old_json)
+        assert state.pending_draft_edit is None
+
+
 class TestGroupChatFields:
     def test_conversation_turn_sender_name_default(self):
         """sender_name defaults to None."""
