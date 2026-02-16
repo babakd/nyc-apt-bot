@@ -319,13 +319,12 @@ def _make_request(
         with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
     except ssl.SSLCertVerificationError:
-        # macOS sometimes has stale SSL certs — try without verification
-        ctx = ssl._create_unverified_context()
-        try:
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                return resp.status, resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", errors="replace")
+        hint = (
+            "TLS certificate verification failed. "
+            "On macOS, run: /Applications/Python\\ 3.XX/Install\\ Certificates.command "
+            "or: pip install certifi"
+        )
+        return 0, hint
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError) as e:
