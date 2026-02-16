@@ -120,6 +120,7 @@ async def daily_scan():
     scraper = ApifyScraper()
     bot = TelegramBot(token=os.environ["SE_TELEGRAM_BOT_TOKEN"])
 
+    volume.reload()
     try:
         await run_daily_scan(scraper, bot)
     except Exception:
