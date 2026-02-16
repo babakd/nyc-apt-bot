@@ -707,6 +707,13 @@ class TestSystemPrompt:
         assert "Budget $4k is firm. 2BR needed for kids." in prompt
         assert "Constraint context" in prompt
 
+    def test_system_prompt_stale_date_guidance(self, fresh_state):
+        """System prompt includes guidance about stale move-in dates."""
+        engine = ConversationEngine(fresh_state)
+        prompt = engine._build_system_prompt()
+
+        assert "move-in date is in the past" in prompt
+
     def test_system_prompt_omits_constraint_context_when_none(self, fresh_state):
         """System prompt omits constraint section when constraint_context is None."""
         engine = ConversationEngine(fresh_state)

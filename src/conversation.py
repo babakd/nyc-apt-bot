@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from src.claude_client import ChatResult, ClaudeClient
@@ -18,6 +19,8 @@ MAX_HISTORY_TURNS = 30
 SYSTEM_PROMPT = """\
 You are a friendly, knowledgeable NYC apartment hunting assistant on Telegram. \
 Your job is to help users find their perfect rental apartment on StreetEasy.
+
+Today's date is {today}.
 
 You need to learn the user's preferences through natural conversation. The key info you need:
 - Monthly budget (min and/or max)
@@ -52,6 +55,11 @@ describe results without actually calling the tool.
 - If a user asks to search, search again, or find apartments, always call search_apartments.
 - If a search fails or returns no results, say so honestly — do not fabricate listings.
 - Every action (search, update preferences, clear history, etc.) must go through its tool call.
+
+IMPORTANT — Stale dates:
+If the user's move-in date is in the past relative to today's date, proactively let them \
+know and ask if they'd like to update it. A past move-in date likely means they forgot to \
+update it, not that they want to time travel.
 
 IMPORTANT — Constraint context:
 When updating preferences, also set the constraint_context field to summarize what's firm \
@@ -527,6 +535,7 @@ class ConversationEngine:
         liked_context = f"\nLiked listings: {liked_count}\n" if liked_count else ""
 
         prompt = SYSTEM_PROMPT.format(
+            today=date.today().strftime("%B %d, %Y"),
             preferences_context=prefs_context,
             preferences_ready=self.state.preferences_ready,
             constraint_context=constraint_context,
