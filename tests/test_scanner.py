@@ -1648,3 +1648,93 @@ class TestEnrichmentConfig:
         assert run_input["maxConcurrency"] == 3
         assert run_input["maxRequestRetries"] == 2
         assert run_input["proxy"]["countryCode"] == "US"
+
+
+# ---------------------------------------------------------------------------
+# I) seen_listing_ids timing tests (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSeenListingIdsTiming:
+    def _make_state(self, **overrides) -> ChatState:
+        state = ChatState(chat_id=12345)
+        state.preferences.budget_max = 4000
+        state.preferences.neighborhoods = ["Chelsea"]
+        state.preferences_ready = True
+        for key, val in overrides.items():
+            setattr(state, key, val)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_filtered_listing_not_marked_seen(self):
+        """Listings excluded by LLM scoring are NOT marked as seen."""
+        state = self._make_state()
+
+        raw_listings = [
+            _raw_listing("1", neighborhood="Chelsea"),
+            _raw_listing("2", neighborhood="Chelsea"),
+        ]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        # LLM only includes listing "1"; listing "2" is excluded
+        scored_listings = [
+            _make_listing("1", neighborhood="Chelsea", match_score=80, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings),
+            ),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+        # Listing "1" was scored and sent → should be marked seen
+        assert "1" in state.seen_listing_ids
+        # Listing "2" was excluded by scoring → should NOT be marked seen
+        assert "2" not in state.seen_listing_ids
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_not_marked_seen(self):
+        """Listings that fail parsing are NOT marked as seen."""
+        state = self._make_state()
+
+        raw_listings = [
+            _raw_listing("1", neighborhood="Chelsea"),
+            {"listing_id": "2", "neighborhood": "Chelsea", "price": "not-a-number"},
+        ]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing("1", neighborhood="Chelsea", match_score=80, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings),
+            ),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+        assert "1" in state.seen_listing_ids
+        # Listing "2" failed to parse → should NOT be marked seen
+        assert "2" not in state.seen_listing_ids

@@ -133,8 +133,8 @@ class TestRetry:
                 await scraper.search_with_retry(_mock_prefs())
 
     @pytest.mark.asyncio
-    async def test_retry_on_empty_results(self):
-        """Empty results trigger retry."""
+    async def test_search_with_retry_returns_empty_without_retry(self):
+        """Empty results from a successful run are returned immediately — no retry."""
         scraper = _make_scraper()
 
         call_count = 0
@@ -142,18 +142,15 @@ class TestRetry:
         async def mock_search(prefs):
             nonlocal call_count
             call_count += 1
-            if call_count <= 2:
-                return []
-            return [{"listing_id": "1", "url": "", "address": "Test", "neighborhood": "Chelsea",
-                      "price": 3000, "bedrooms": 1, "bathrooms": 1}]
+            return []
 
         scraper.search_streeteasy = mock_search
 
         with patch("src.apify_scraper.asyncio.sleep", new_callable=AsyncMock):
             results = await scraper.search_with_retry(_mock_prefs())
 
-        assert len(results) == 1
-        assert call_count == 3
+        assert results == []
+        assert call_count == 1  # Only one attempt — no retries for empty results
 
 
 class TestConfig:

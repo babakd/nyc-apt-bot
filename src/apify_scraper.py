@@ -112,7 +112,9 @@ class ApifyScraper:
     ) -> list[dict[str, Any]]:
         """Wrap search_streeteasy with exponential backoff retries.
 
-        Retries on ApifyScraperError or empty results.
+        Retries only on ApifyScraperError (infrastructure failures).
+        Empty results from a successful run are returned immediately —
+        they indicate a legitimate "no matches" rather than a failure.
         """
         last_error: Exception | None = None
 
@@ -120,11 +122,7 @@ class ApifyScraper:
             try:
                 logger.info("search_with_retry: attempt %d/%d", attempt + 1, 1 + max_retries)
                 results = await self.search_streeteasy(prefs)
-                if results:
-                    return results
-                # Empty results — treat as retryable
-                logger.warning("search_with_retry: attempt %d returned 0 results", attempt + 1)
-                last_error = ApifyScraperError("Empty results from Apify")
+                return results
             except ApifyScraperError as e:
                 logger.warning("search_with_retry: attempt %d failed: %s", attempt + 1, e)
                 last_error = e

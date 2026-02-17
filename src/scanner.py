@@ -148,13 +148,12 @@ async def scan_for_chat(
         await telegram_bot.send_text(state.chat_id, format_scan_header(0))
         return
 
-    # Deduplicate
+    # Deduplicate (check only — marking as seen happens after successful send)
     new_listings = []
     for raw in raw_listings:
         lid = str(raw.get("listing_id", ""))
         if lid and lid not in state.seen_listing_ids:
             new_listings.append(raw)
-            state.seen_listing_ids.add(lid)
 
     if not new_listings:
         await telegram_bot.send_text(state.chat_id, format_scan_header(0))
@@ -236,6 +235,10 @@ async def scan_for_chat(
                     card_text,
                     keyboard=keyboard,
                 )
+
+    # Mark scored listings as seen (only after successful scoring/sending)
+    for listing in scored:
+        state.seen_listing_ids.add(listing.listing_id)
 
     # Cache successful scan results
     if scored:
