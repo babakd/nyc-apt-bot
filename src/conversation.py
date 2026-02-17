@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from src.claude_client import ChatResult, ClaudeClient
@@ -18,6 +19,8 @@ MAX_HISTORY_TURNS = 30
 SYSTEM_PROMPT = """\
 You are a friendly, knowledgeable NYC apartment hunting assistant on Telegram. \
 Your job is to help users find their perfect rental apartment on StreetEasy.
+
+Today's date is {current_date}.
 
 You need to learn the user's preferences through natural conversation. The key info you need:
 - Monthly budget (min and/or max)
@@ -513,7 +516,11 @@ class ConversationEngine:
     def _build_system_prompt(self) -> str:
         """Build system prompt with current preferences context."""
         prefs = self.state.preferences
-        if any([prefs.budget_max, prefs.bedrooms, prefs.neighborhoods, prefs.min_bathrooms, prefs.must_haves]):
+        if any([
+            prefs.budget_min, prefs.budget_max, prefs.bedrooms, prefs.neighborhoods,
+            prefs.min_bathrooms, prefs.must_haves, prefs.nice_to_haves,
+            prefs.commute_address, prefs.no_fee_only, prefs.move_in_date,
+        ]):
             prefs_context = format_preferences_summary(prefs)
         else:
             prefs_context = "No preferences set yet."
@@ -553,6 +560,7 @@ class ConversationEngine:
         liked_context = f"\nLiked listings: {liked_count}\n" if liked_count else ""
 
         prompt = SYSTEM_PROMPT.format(
+            current_date=date.today().isoformat(),
             preferences_context=prefs_context,
             preferences_ready=self.state.preferences_ready,
             constraint_context=constraint_context,

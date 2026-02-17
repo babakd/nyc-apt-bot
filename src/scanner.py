@@ -9,7 +9,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import anthropic
@@ -589,6 +589,7 @@ async def _llm_score_listings(
             apt_text = "\nCurrent apartment:\n" + "\n".join(apt_parts)
 
     prompt = (
+        f"Today's date is {date.today().isoformat()}.\n\n"
         "Filter and score these NYC apartment listings against the user's preferences.\n"
         "Return ONLY a JSON array, no other text.\n\n"
         f"User preferences:\n{prefs_text}{constraint_text}{apt_text}\n\n"

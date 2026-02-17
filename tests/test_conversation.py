@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -721,6 +722,53 @@ class TestSystemPrompt:
         prompt = engine._build_system_prompt()
 
         assert "\nConstraint context: " not in prompt
+
+    def test_system_prompt_includes_current_date(self, fresh_state):
+        """System prompt includes today's date."""
+        engine = ConversationEngine(fresh_state)
+        prompt = engine._build_system_prompt()
+
+        assert f"Today's date is {date.today().isoformat()}" in prompt
+
+    def test_system_prompt_shows_prefs_with_budget_min_only(self, fresh_state):
+        """System prompt shows preferences (not 'No preferences') when only budget_min is set."""
+        fresh_state.preferences.budget_min = 2000
+        engine = ConversationEngine(fresh_state)
+        prompt = engine._build_system_prompt()
+
+        assert "No preferences set yet" not in prompt
+
+    def test_system_prompt_shows_prefs_with_no_fee_only(self, fresh_state):
+        """System prompt shows preferences when only no_fee_only is set."""
+        fresh_state.preferences.no_fee_only = True
+        engine = ConversationEngine(fresh_state)
+        prompt = engine._build_system_prompt()
+
+        assert "No preferences set yet" not in prompt
+
+    def test_system_prompt_shows_prefs_with_nice_to_haves_only(self, fresh_state):
+        """System prompt shows preferences when only nice_to_haves is set."""
+        fresh_state.preferences.nice_to_haves = ["Gym", "Roof Deck"]
+        engine = ConversationEngine(fresh_state)
+        prompt = engine._build_system_prompt()
+
+        assert "No preferences set yet" not in prompt
+
+    def test_system_prompt_shows_prefs_with_move_in_date_only(self, fresh_state):
+        """System prompt shows preferences when only move_in_date is set."""
+        fresh_state.preferences.move_in_date = "2026-04-01"
+        engine = ConversationEngine(fresh_state)
+        prompt = engine._build_system_prompt()
+
+        assert "No preferences set yet" not in prompt
+
+    def test_system_prompt_shows_prefs_with_commute_only(self, fresh_state):
+        """System prompt shows preferences when only commute_address is set."""
+        fresh_state.preferences.commute_address = "Times Square"
+        engine = ConversationEngine(fresh_state)
+        prompt = engine._build_system_prompt()
+
+        assert "No preferences set yet" not in prompt
 
 
 class TestStructuredHistory:

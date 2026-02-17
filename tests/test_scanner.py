@@ -1738,3 +1738,31 @@ class TestSeenListingIdsTiming:
         assert "1" in state.seen_listing_ids
         # Listing "2" failed to parse → should NOT be marked seen
         assert "2" not in state.seen_listing_ids
+
+
+# ---------------------------------------------------------------------------
+# J) Scoring prompt date injection tests (Fix 4)
+# ---------------------------------------------------------------------------
+
+
+class TestScoringPromptDate:
+    @pytest.mark.asyncio
+    async def test_scoring_prompt_includes_date(self):
+        """The scoring prompt sent to Claude includes today's date."""
+        from datetime import date
+
+        listings = [_make_listing("1")]
+        prefs = Preferences(budget_max=4000)
+
+        scores = [
+            {"id": "1", "include": True, "score": 70, "pros": ["ok"], "cons": []},
+        ]
+        mock_client = _mock_anthropic_client(_mock_llm_response(scores))
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client):
+            await _llm_score_listings(listings, prefs)
+
+            call_kwargs = mock_client.messages.create.call_args
+            messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
+            prompt_text = messages[0]["content"]
+            assert f"Today's date is {date.today().isoformat()}" in prompt_text
