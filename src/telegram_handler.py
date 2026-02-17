@@ -10,7 +10,7 @@ import httpx
 
 from src.conversation import ConversationEngine, Response
 from src.models import ChatState
-from src.storage import load_state, save_state
+from src.storage import chat_lock, load_state, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -132,65 +132,66 @@ class TelegramBot:
 
         logger.info("Message from chat %s: %s", chat_id, text[:100])
 
-        state = load_state(chat_id)
-        if is_group and not state.is_group:
-            state.is_group = True
+        async with chat_lock(chat_id):
+            state = load_state(chat_id)
+            if is_group and not state.is_group:
+                state.is_group = True
 
-        # Check for pending draft edit — route to revise_draft directly
-        if state.pending_draft_edit:
-            draft_id = state.pending_draft_edit
-            state.pending_draft_edit = None
-            save_state(state)
-            try:
-                from src.outreach import revise_draft
-                await revise_draft(self, chat_id, draft_id, text)
-            except Exception:
-                logger.exception("Draft revision failed")
-                await self.send_text(chat_id, "⚠️ Failed to revise the draft. Please try again.")
-            return
-
-        engine = ConversationEngine(state)
-        result = await engine.handle_message(text, sender_name=sender_name)
-
-        save_state(state)
-
-        # Send text responses
-        await self._send_responses(chat_id, result.responses)
-
-        # Run scan inline — update_id dedup prevents Telegram retries from
-        # causing duplicate messages, and Modal's allow_concurrent_inputs
-        # lets other webhooks proceed while this one waits for Apify.
-        if result.trigger_search and self._scan_callback:
-            try:
-                await self._scan_callback(chat_id, state)
-            except Exception:
-                logger.exception("Scan triggered by conversation failed")
-                await self.send_text(
-                    chat_id, "⚠️ Scan failed. Please try again later."
-                )
-
-        # Draft outreach if triggered by conversation
-        if result.trigger_draft_listing_id:
-            listing_id = result.trigger_draft_listing_id
-            listing = (
-                state.recent_listings.get(listing_id)
-                or state.liked_listings.get(listing_id)
-            )
-            if listing:
+            # Check for pending draft edit — route to revise_draft directly
+            if state.pending_draft_edit:
+                draft_id = state.pending_draft_edit
+                state.pending_draft_edit = None
+                save_state(state)
                 try:
-                    from src.outreach import create_draft
-                    await create_draft(self, chat_id, listing)
+                    from src.outreach import revise_draft
+                    await revise_draft(self, chat_id, draft_id, text)
                 except Exception:
-                    logger.exception("Draft creation failed")
+                    logger.exception("Draft revision failed")
+                    await self.send_text(chat_id, "⚠️ Failed to revise the draft. Please try again.")
+                return
+
+            engine = ConversationEngine(state)
+            result = await engine.handle_message(text, sender_name=sender_name)
+
+            save_state(state)
+
+            # Send text responses
+            await self._send_responses(chat_id, result.responses)
+
+            # Run scan inline — update_id dedup prevents Telegram retries from
+            # causing duplicate messages, and Modal's allow_concurrent_inputs
+            # lets other webhooks proceed while this one waits for Apify.
+            if result.trigger_search and self._scan_callback:
+                try:
+                    await self._scan_callback(chat_id, state)
+                except Exception:
+                    logger.exception("Scan triggered by conversation failed")
                     await self.send_text(
-                        chat_id, "⚠️ Failed to create draft. Please try again."
+                        chat_id, "⚠️ Scan failed. Please try again later."
                     )
-            else:
-                await self.send_text(
-                    chat_id,
-                    f"I don't have details for listing {listing_id}. "
-                    "Try liking a listing from search results first, then ask me to draft a message.",
+
+            # Draft outreach if triggered by conversation
+            if result.trigger_draft_listing_id:
+                listing_id = result.trigger_draft_listing_id
+                listing = (
+                    state.recent_listings.get(listing_id)
+                    or state.liked_listings.get(listing_id)
                 )
+                if listing:
+                    try:
+                        from src.outreach import create_draft
+                        await create_draft(self, chat_id, listing)
+                    except Exception:
+                        logger.exception("Draft creation failed")
+                        await self.send_text(
+                            chat_id, "⚠️ Failed to create draft. Please try again."
+                        )
+                else:
+                    await self.send_text(
+                        chat_id,
+                        f"I don't have details for listing {listing_id}. "
+                        "Try liking a listing from search results first, then ask me to draft a message.",
+                    )
 
     async def _handle_callback_query(self, callback: dict[str, Any]) -> None:
         """Handle an inline keyboard button press."""
@@ -204,57 +205,58 @@ class TelegramBot:
         # Always answer the callback to remove loading state
         await self._answer_callback(callback_id)
 
-        state = load_state(chat_id)
+        async with chat_lock(chat_id):
+            state = load_state(chat_id)
 
-        # Listing action callbacks
-        if data.startswith("like:"):
-            listing_id = data.split(":", 1)[1]
-            state.liked_listing_ids.add(listing_id)
-            # Store full listing data if available
-            if listing_id in state.recent_listings:
-                state.liked_listings[listing_id] = state.recent_listings[listing_id]
-            save_state(state)
-            await self.send_text(chat_id, f"👍 Liked! I'll keep this in mind for your search.")
-            return
-
-        if data.startswith("pass:"):
-            listing_id = data.split(":", 1)[1]
-            save_state(state)
-            await self.send_text(chat_id, "👎 Passed. Moving on!")
-            return
-
-        if data.startswith("details:"):
-            listing_id = data.split(":", 1)[1]
-            await self._send_listing_details(chat_id, listing_id)
-            return
-
-        # Draft action callbacks
-        if data.startswith("draft_send:"):
-            draft_id = data.split(":", 1)[1]
-            await self._send_draft(chat_id, draft_id)
-            return
-
-        if data.startswith("draft_edit:"):
-            draft_id = data.split(":", 1)[1]
-            # Validate draft exists and is pending
-            draft = state.active_drafts.get(draft_id)
-            if not draft or draft.status != "pending":
-                await self.send_text(chat_id, "This draft is no longer available for editing.")
-                return
-            state.pending_draft_edit = draft_id
-            save_state(state)
-            await self.send_text(chat_id, "✏️ What would you like to change? Send me your feedback.")
-            return
-
-        if data.startswith("draft_cancel:"):
-            draft_id = data.split(":", 1)[1]
-            if draft_id in state.active_drafts:
-                state.active_drafts[draft_id].status = "cancelled"
+            # Listing action callbacks
+            if data.startswith("like:"):
+                listing_id = data.split(":", 1)[1]
+                state.liked_listing_ids.add(listing_id)
+                # Store full listing data if available
+                if listing_id in state.recent_listings:
+                    state.liked_listings[listing_id] = state.recent_listings[listing_id]
                 save_state(state)
-            await self.send_text(chat_id, "❌ Draft cancelled.")
-            return
+                await self.send_text(chat_id, f"👍 Liked! I'll keep this in mind for your search.")
+                return
 
-        logger.warning("Unknown callback data: %s", data)
+            if data.startswith("pass:"):
+                listing_id = data.split(":", 1)[1]
+                save_state(state)
+                await self.send_text(chat_id, "👎 Passed. Moving on!")
+                return
+
+            if data.startswith("details:"):
+                listing_id = data.split(":", 1)[1]
+                await self._send_listing_details(chat_id, listing_id)
+                return
+
+            # Draft action callbacks
+            if data.startswith("draft_send:"):
+                draft_id = data.split(":", 1)[1]
+                await self._send_draft(chat_id, draft_id)
+                return
+
+            if data.startswith("draft_edit:"):
+                draft_id = data.split(":", 1)[1]
+                # Validate draft exists and is pending
+                draft = state.active_drafts.get(draft_id)
+                if not draft or draft.status != "pending":
+                    await self.send_text(chat_id, "This draft is no longer available for editing.")
+                    return
+                state.pending_draft_edit = draft_id
+                save_state(state)
+                await self.send_text(chat_id, "✏️ What would you like to change? Send me your feedback.")
+                return
+
+            if data.startswith("draft_cancel:"):
+                draft_id = data.split(":", 1)[1]
+                if draft_id in state.active_drafts:
+                    state.active_drafts[draft_id].status = "cancelled"
+                    save_state(state)
+                await self.send_text(chat_id, "❌ Draft cancelled.")
+                return
+
+            logger.warning("Unknown callback data: %s", data)
 
     # --- Outgoing Messages ---
 

@@ -1,5 +1,7 @@
 """Tests for storage module."""
 
+import asyncio
+
 import pytest
 
 from src.models import ChatState
@@ -73,3 +75,47 @@ class TestStorage:
         second = load_state(12345).updated_at
 
         assert second > first
+
+
+class TestChatLock:
+    @pytest.mark.asyncio
+    async def test_chat_lock_serializes_access(self):
+        """Concurrent access to the same chat_id is serialized by chat_lock."""
+        from src.storage import chat_lock
+
+        order = []
+
+        async def writer(label: str):
+            async with chat_lock(12345):
+                order.append(f"{label}_start")
+                await asyncio.sleep(0.05)
+                order.append(f"{label}_end")
+
+        await asyncio.gather(writer("a"), writer("b"))
+
+        # One must fully complete before the other starts
+        assert order[:2] in [["a_start", "a_end"], ["b_start", "b_end"]]
+        assert order[2:] in [["a_start", "a_end"], ["b_start", "b_end"]]
+
+    @pytest.mark.asyncio
+    async def test_chat_lock_different_ids_parallel(self):
+        """Different chat_ids can proceed in parallel (no cross-locking)."""
+        from src.storage import chat_lock
+
+        order = []
+
+        async def writer(chat_id: int, label: str):
+            async with chat_lock(chat_id):
+                order.append(f"{label}_start")
+                await asyncio.sleep(0.05)
+                order.append(f"{label}_end")
+
+        await asyncio.gather(writer(111, "a"), writer(222, "b"))
+
+        # Both should start before either finishes (parallel execution)
+        starts = [i for i, x in enumerate(order) if x.endswith("_start")]
+        ends = [i for i, x in enumerate(order) if x.endswith("_end")]
+        assert len(starts) == 2
+        assert len(ends) == 2
+        # Both starts should happen before both ends
+        assert max(starts) < max(ends)

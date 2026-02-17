@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from src.models import ChatState, Preferences
 
 logger = logging.getLogger(__name__)
+
+_chat_locks: dict[int, asyncio.Lock] = {}
+
+
+@asynccontextmanager
+async def chat_lock(chat_id: int):
+    """Acquire a per-chat asyncio lock to serialize state mutations."""
+    if chat_id not in _chat_locks:
+        _chat_locks[chat_id] = asyncio.Lock()
+    async with _chat_locks[chat_id]:
+        yield
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 
