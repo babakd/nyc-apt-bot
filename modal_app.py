@@ -56,7 +56,7 @@ class TelegramWebhook:
 
         # Set up scan callback so conversation engine can trigger scans
         async def do_scan(chat_id, state):
-            await scan_for_chat(self.scraper, self.bot, state)
+            await scan_for_chat(self.scraper, self.bot, state, is_daily=False)
 
         self.bot.set_scan_callback(do_scan)
         logger.info("Webhook handler ready (Apify scraper)")

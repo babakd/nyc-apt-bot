@@ -1766,3 +1766,108 @@ class TestScoringPromptDate:
             messages = call_kwargs.kwargs.get("messages") or call_kwargs[1].get("messages")
             prompt_text = messages[0]["content"]
             assert f"Today's date is {date.today().isoformat()}" in prompt_text
+
+
+# ---------------------------------------------------------------------------
+# K) is_daily parameter tests (Fix 7)
+# ---------------------------------------------------------------------------
+
+
+class TestIsDailyParam:
+    def _make_state(self, **overrides) -> ChatState:
+        state = ChatState(chat_id=12345)
+        state.preferences.budget_max = 4000
+        state.preferences.neighborhoods = ["Chelsea"]
+        state.preferences_ready = True
+        for key, val in overrides.items():
+            setattr(state, key, val)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_manual_scan_header(self):
+        """Manual search (is_daily=False) uses 'Search Results' header."""
+        state = self._make_state()
+
+        raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing("1", neighborhood="Chelsea", match_score=80, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings),
+            ),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state, is_daily=False)
+
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        assert any("Search Results" in t for t in sent_texts)
+        assert not any("Daily Scan" in t for t in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_daily_scan_header(self):
+        """Daily scan (is_daily=True, default) uses 'Daily Scan Complete' header."""
+        state = self._make_state()
+
+        raw_listings = [_raw_listing("1", neighborhood="Chelsea")]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scored_listings = [
+            _make_listing("1", neighborhood="Chelsea", match_score=80, photos=[]),
+        ]
+
+        with (
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", new_callable=AsyncMock, return_value={}),
+            patch(
+                "src.scanner._llm_score_listings",
+                new_callable=AsyncMock,
+                return_value=ScoringResult(listings=scored_listings),
+            ),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state)
+
+        sent_texts = [
+            call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+            for call in mock_bot.send_text.call_args_list
+        ]
+        assert any("Daily Scan Complete" in t for t in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_manual_scan_no_results_no_tomorrow(self):
+        """Manual search with 0 results omits 'tomorrow' phrasing."""
+        state = self._make_state()
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=[])
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+
+        with patch("src.scanner.save_state"):
+            await scan_for_chat(mock_scraper, mock_bot, state, is_daily=False)
+
+        sent_text = mock_bot.send_text.call_args[0][1]
+        assert "tomorrow" not in sent_text
+        assert "Search Results" in sent_text

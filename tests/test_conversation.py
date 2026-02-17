@@ -250,6 +250,18 @@ class TestToolExecution:
         assert result.trigger_search is False
 
     @pytest.mark.asyncio
+    async def test_search_apartments_allows_budget_min_only(self, fresh_state):
+        """search_apartments allows search with only budget_min set."""
+        fresh_state.preferences.budget_min = 2000
+        engine = ConversationEngine(fresh_state)
+
+        result = ConversationResult()
+        output = engine._execute_tool("search_apartments", {}, result)
+
+        assert result.trigger_search is True
+        assert "Cannot search" not in output
+
+    @pytest.mark.asyncio
     async def test_mark_ready(self, fresh_state):
         """mark_ready tool sets preferences_ready flag."""
         engine = ConversationEngine(fresh_state)

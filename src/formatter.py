@@ -159,12 +159,20 @@ def format_draft_message(draft_text: str, listing: Listing) -> str:
     )
 
 
-def format_scan_header(count: int) -> str:
-    """Format the header message for daily scan results."""
+def format_scan_header(count: int, is_daily: bool = True) -> str:
+    """Format the header message for scan results.
+
+    Args:
+        count: Number of listings found.
+        is_daily: True for daily cron scan, False for user-triggered search.
+    """
+    title = "Daily Scan Complete" if is_daily else "Search Results"
     if count == 0:
-        return "🔍 <b>Daily Scan Complete</b>\n\nNo new listings found matching your criteria today. I'll check again tomorrow!"
+        if is_daily:
+            return f"🔍 <b>{title}</b>\n\nNo new listings found matching your criteria today. I'll check again tomorrow!"
+        return f"🔍 <b>{title}</b>\n\nNo new listings found matching your criteria."
     return (
-        f"🔍 <b>Daily Scan Complete</b>\n\n"
+        f"🔍 <b>{title}</b>\n\n"
         f"Found <b>{count}</b> new listing{'s' if count != 1 else ''} "
         f"matching your preferences, ranked by match score:"
     )

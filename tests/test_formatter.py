@@ -261,6 +261,30 @@ class TestScanHeader:
         assert "listings" in header
         assert "ranked" in header
 
+    def test_scan_header_manual_search(self):
+        """Manual search uses 'Search Results' instead of 'Daily Scan Complete'."""
+        header = format_scan_header(3, is_daily=False)
+        assert "Search Results" in header
+        assert "Daily Scan" not in header
+        assert "3" in header
+
+    def test_scan_header_manual_search_no_results(self):
+        """Manual search with 0 results omits 'tomorrow' phrasing."""
+        header = format_scan_header(0, is_daily=False)
+        assert "Search Results" in header
+        assert "tomorrow" not in header
+        assert "No new listings" in header
+
+    def test_scan_header_daily_default(self):
+        """Default (is_daily=True) uses 'Daily Scan Complete'."""
+        header = format_scan_header(2, is_daily=True)
+        assert "Daily Scan Complete" in header
+
+    def test_scan_header_daily_no_results_mentions_tomorrow(self):
+        """Daily scan with 0 results mentions 'tomorrow'."""
+        header = format_scan_header(0, is_daily=True)
+        assert "tomorrow" in header
+
 
 class TestKeyboards:
     def test_listing_keyboard_without_url(self):

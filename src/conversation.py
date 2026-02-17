@@ -650,7 +650,9 @@ class ConversationEngine:
 
     def _tool_search_apartments(self, result: ConversationResult) -> str:
         """Signal that a search should be triggered."""
-        if not self.state.preferences.neighborhoods and not self.state.preferences.budget_max:
+        if (not self.state.preferences.neighborhoods
+                and not self.state.preferences.budget_max
+                and not self.state.preferences.budget_min):
             return "Cannot search yet — need at least a budget or neighborhoods to search."
         result.trigger_search = True
         return "Search triggered. Results will be sent shortly."

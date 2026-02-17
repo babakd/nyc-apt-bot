@@ -100,6 +100,7 @@ async def scan_for_chat(
     scraper: ApifyScraper,
     telegram_bot: "TelegramBot",
     state: ChatState,
+    is_daily: bool = True,
 ) -> None:
     """Scan StreetEasy for a single chat's preferences."""
     prefs = state.preferences
@@ -145,7 +146,7 @@ async def scan_for_chat(
         return
 
     if not raw_listings:
-        await telegram_bot.send_text(state.chat_id, format_scan_header(0))
+        await telegram_bot.send_text(state.chat_id, format_scan_header(0, is_daily=is_daily))
         return
 
     # Deduplicate (check only — marking as seen happens after successful send)
@@ -156,7 +157,7 @@ async def scan_for_chat(
             new_listings.append(raw)
 
     if not new_listings:
-        await telegram_bot.send_text(state.chat_id, format_scan_header(0))
+        await telegram_bot.send_text(state.chat_id, format_scan_header(0, is_daily=is_daily))
         save_state(state)
         return
 
@@ -174,11 +175,11 @@ async def scan_for_chat(
 
     if not filtered and parsed:
         logger.info("All %d listings filtered out by neighborhood pre-filter", len(parsed))
-        await telegram_bot.send_text(
-            state.chat_id,
-            "\ud83d\udd0d No listings found in your neighborhoods today. "
-            "I'll check again tomorrow!",
-        )
+        if is_daily:
+            msg = "\ud83d\udd0d No listings found in your neighborhoods today. I'll check again tomorrow!"
+        else:
+            msg = "\ud83d\udd0d No listings found in your neighborhoods."
+        await telegram_bot.send_text(state.chat_id, msg)
         save_state(state)
         return
 
@@ -206,9 +207,9 @@ async def scan_for_chat(
 
     # Send results
     if not scored:
-        await telegram_bot.send_text(state.chat_id, format_scan_header(0))
+        await telegram_bot.send_text(state.chat_id, format_scan_header(0, is_daily=is_daily))
     else:
-        await telegram_bot.send_text(state.chat_id, format_scan_header(len(scored)))
+        await telegram_bot.send_text(state.chat_id, format_scan_header(len(scored), is_daily=is_daily))
 
         if scoring_result.is_fallback:
             await telegram_bot.send_text(
