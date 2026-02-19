@@ -39,6 +39,7 @@ secrets = [
     scaledown_window=300,
     memory=2048,
     cpu=2.0,
+    timeout=1200,
 )
 @modal.concurrent(max_inputs=10)
 class TelegramWebhook:

@@ -239,6 +239,30 @@ class TestToolExecution:
         assert result.trigger_search is True
 
     @pytest.mark.asyncio
+    async def test_search_apartments_auto_enables_daily_scans(self, fresh_state):
+        """search_apartments auto-enables daily scans on first search."""
+        fresh_state.preferences.neighborhoods = ["Chelsea"]
+        assert fresh_state.preferences_ready is False
+        engine = ConversationEngine(fresh_state)
+
+        result = ConversationResult()
+        engine._execute_tool("search_apartments", {}, result)
+
+        assert result.trigger_search is True
+        assert fresh_state.preferences_ready is True
+
+    @pytest.mark.asyncio
+    async def test_search_apartments_keeps_daily_scans_if_already_enabled(self, state_with_prefs):
+        """search_apartments doesn't toggle preferences_ready if already True."""
+        assert state_with_prefs.preferences_ready is True
+        engine = ConversationEngine(state_with_prefs)
+
+        result = ConversationResult()
+        engine._execute_tool("search_apartments", {}, result)
+
+        assert state_with_prefs.preferences_ready is True
+
+    @pytest.mark.asyncio
     async def test_search_apartments_requires_prefs(self, fresh_state):
         """search_apartments tool fails without minimum preferences."""
         engine = ConversationEngine(fresh_state)
@@ -248,6 +272,7 @@ class TestToolExecution:
 
         assert "Cannot search" in output
         assert result.trigger_search is False
+        assert fresh_state.preferences_ready is False
 
     @pytest.mark.asyncio
     async def test_search_apartments_allows_budget_min_only(self, fresh_state):
@@ -260,6 +285,7 @@ class TestToolExecution:
 
         assert result.trigger_search is True
         assert "Cannot search" not in output
+        assert fresh_state.preferences_ready is True
 
     @pytest.mark.asyncio
     async def test_mark_ready(self, fresh_state):

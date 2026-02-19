@@ -41,8 +41,8 @@ Guidelines:
 For example: "the village" could mean West Village, East Village, or Greenwich Village — ask if unclear.
 - Use the update_preferences tool whenever you extract new preference info from the user's message.
 - Call show_preferences when the user wants to see their current preferences.
-- Call search_apartments when the user wants to search or is ready to find apartments.
-- Call mark_ready when the user has confirmed their preferences look good and they're ready for daily scans.
+- Call search_apartments when the user wants to search or is ready to find apartments. \
+Daily scans are automatically enabled when the user searches for the first time.
 - You can update preferences at any time — users can change their mind.
 - Keep responses concise (2-4 sentences usually). This is a chat, not an essay.
 - Use plain text, not markdown. Telegram doesn't render markdown in bot messages.
@@ -655,6 +655,10 @@ class ConversationEngine:
                 and not self.state.preferences.budget_min):
             return "Cannot search yet — need at least a budget or neighborhoods to search."
         result.trigger_search = True
+        # Auto-enable daily scans on first successful search
+        if not self.state.preferences_ready:
+            self.state.preferences_ready = True
+            logger.info("Auto-enabled daily scans for chat %s", self.state.chat_id)
         return "Search triggered. Results will be sent shortly."
 
     def _tool_mark_ready(self) -> str:
