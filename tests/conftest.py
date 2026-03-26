@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
 from src.models import Listing
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "e2e: end-to-end integration tests (may be slow)")
 
 
 def make_listing(listing_id: str = "123", **overrides) -> Listing:

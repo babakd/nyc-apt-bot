@@ -9,6 +9,7 @@ from src.formatter import (
     draft_keyboard,
     format_listing_card,
     format_preferences_summary,
+    format_preferences_summary_plain,
     format_scan_header,
     listing_keyboard,
 )
@@ -89,8 +90,9 @@ class TestListingCard:
         assert "85% match" in card
         assert "Great location" in card
         assert "No laundry" in card
-        # Uses triangle bullets
-        assert "\u25b8" in card
+        # Pros use +, cons use -
+        assert "+ Great location" in card
+        assert "- No laundry" in card
 
     def test_card_with_rank(self):
         listing = Listing(
@@ -328,3 +330,121 @@ class TestPayloadBuilder:
         kb = [[{"text": "OK", "callback_data": "ok"}]]
         payload = build_send_message_payload(123, "Hello", reply_markup=kb)
         assert "reply_markup" in payload
+
+
+class TestPreferencesSummaryEscaping:
+    """Bug 5: HTML escaping in format_preferences_summary."""
+
+    def test_neighborhoods_escaped(self):
+        prefs = Preferences(neighborhoods=["<script>alert(1)</script>"])
+        summary = format_preferences_summary(prefs)
+        assert "<script>" not in summary
+        assert "&lt;script&gt;" in summary
+
+    def test_must_haves_escaped(self):
+        prefs = Preferences(must_haves=["Dishwasher & Laundry"])
+        summary = format_preferences_summary(prefs)
+        assert "Dishwasher &amp; Laundry" in summary
+
+    def test_nice_to_haves_escaped(self):
+        prefs = Preferences(nice_to_haves=["<b>Gym</b>"])
+        summary = format_preferences_summary(prefs)
+        assert "<b>Gym</b>" not in summary
+        assert "&lt;b&gt;Gym&lt;/b&gt;" in summary
+
+    def test_move_in_date_escaped(self):
+        prefs = Preferences(move_in_date="April <1> 2026")
+        summary = format_preferences_summary(prefs)
+        assert "April &lt;1&gt; 2026" in summary
+
+
+class TestBudgetMinDisplay:
+    """Bug 7: budget_min-only display."""
+
+    def test_budget_min_only_shown(self):
+        prefs = Preferences(budget_min=2000)
+        summary = format_preferences_summary(prefs)
+        assert "Budget" in summary
+        assert "$2,000" in summary
+
+    def test_budget_min_and_max_shown(self):
+        prefs = Preferences(budget_min=2000, budget_max=4000)
+        summary = format_preferences_summary(prefs)
+        assert "$2,000" in summary
+        assert "$4,000" in summary
+
+    def test_budget_max_only_shows_zero_min(self):
+        prefs = Preferences(budget_max=4000)
+        summary = format_preferences_summary(prefs)
+        assert "$0" in summary
+        assert "$4,000" in summary
+
+
+class TestProConDistinction:
+    """Bug 9: Pros and cons should be visually distinct."""
+
+    def test_pros_use_plus(self):
+        listing = Listing(
+            listing_id="1", url="", address="Test", neighborhood="EV",
+            price=3000, bedrooms=1, bathrooms=1.0,
+            pros=["Great location"], cons=[],
+        )
+        card = format_listing_card(listing)
+        assert "+ Great location" in card
+
+    def test_cons_use_minus(self):
+        listing = Listing(
+            listing_id="1", url="", address="Test", neighborhood="EV",
+            price=3000, bedrooms=1, bathrooms=1.0,
+            pros=[], cons=["No dishwasher"],
+        )
+        card = format_listing_card(listing)
+        assert "- No dishwasher" in card
+
+    def test_pros_and_cons_distinguishable(self):
+        listing = Listing(
+            listing_id="1", url="", address="Test", neighborhood="EV",
+            price=3000, bedrooms=1, bathrooms=1.0,
+            pros=["Great"], cons=["Bad"],
+        )
+        card = format_listing_card(listing)
+        assert "+ Great" in card
+        assert "- Bad" in card
+
+
+class TestPlainTextSummary:
+    """Bug 6: Plain-text preferences summary for tool results."""
+
+    def test_no_html_tags(self):
+        prefs = Preferences(
+            budget_max=4000, bedrooms=[1], neighborhoods=["East Village"],
+            must_haves=["Dishwasher"],
+        )
+        plain = format_preferences_summary_plain(prefs)
+        assert "<b>" not in plain
+        assert "</" not in plain
+        assert "&amp;" not in plain
+
+    def test_contains_all_fields(self):
+        prefs = Preferences(
+            budget_min=2000, budget_max=4000, bedrooms=[1, 2],
+            neighborhoods=["East Village", "Chelsea"],
+            must_haves=["Dishwasher"], nice_to_haves=["Gym"],
+            no_fee_only=True, move_in_date="April 2026",
+        )
+        plain = format_preferences_summary_plain(prefs)
+        assert "Budget" in plain
+        assert "$2,000" in plain
+        assert "$4,000" in plain
+        assert "1 BR" in plain
+        assert "East Village" in plain
+        assert "Dishwasher" in plain
+        assert "Gym" in plain
+        assert "No-fee only" in plain
+        assert "April 2026" in plain
+
+    def test_budget_min_only_plain(self):
+        prefs = Preferences(budget_min=3000)
+        plain = format_preferences_summary_plain(prefs)
+        assert "$3,000" in plain
+        assert "+/mo" in plain

@@ -10,7 +10,7 @@ from typing import Any
 
 from src.claude_client import ChatResult, ClaudeClient
 from src.config import MAX_HISTORY_TURNS
-from src.formatter import _escape_html, format_apartment_context, format_preferences_summary
+from src.formatter import _escape_html, format_apartment_context, format_preferences_summary, format_preferences_summary_plain
 from src.models import ChatState, ConversationTurn, CurrentApartment, Preferences
 
 logger = logging.getLogger(__name__)
@@ -638,8 +638,8 @@ class ConversationEngine:
         return f"Updated: {', '.join(updated_fields)}" if updated_fields else "No changes made."
 
     def _tool_show_preferences(self) -> str:
-        """Return formatted preferences summary."""
-        return format_preferences_summary(self.state.preferences)
+        """Return formatted preferences summary as plain text for Claude."""
+        return format_preferences_summary_plain(self.state.preferences)
 
     def _tool_search_apartments(self, result: ConversationResult) -> str:
         """Signal that a search should be triggered."""

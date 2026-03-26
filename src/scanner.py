@@ -46,6 +46,7 @@ class FilterResult:
     after_baths: int = 0
     after_stale: int = 0
     after_budget: int = 0
+    after_min_budget: int = 0
     after_fee: int = 0
 
 
@@ -242,6 +243,7 @@ async def scan_for_chat(
 
     if not raw_listings:
         await telegram_bot.send_text(state.chat_id, format_scan_header(0, is_daily=is_daily))
+        save_state(state)
         return
 
     # Deduplicate by listing_id within this run, and drop already-seen listings.
@@ -374,11 +376,11 @@ async def scan_for_chat(
     # Funnel logging
     logger.info(
         "Scan funnel for chat %s: Raw=%d | Dedup=%d | Hood=%d | Beds=%d | Baths=%d | "
-        "Stale=%d | Budget=%d | Fee=%d | Enriched=%d | LLM=%d | Bldg=%d | Sent=%d",
+        "Stale=%d | Budget=%d | MinBudget=%d | Fee=%d | Enriched=%d | LLM=%d | Bldg=%d | Sent=%d",
         state.chat_id, len(raw_listings), len(new_listings), filter_result.after_hood,
         filter_result.after_beds, filter_result.after_baths, filter_result.after_stale,
-        filter_result.after_budget, filter_result.after_fee, enriched_count,
-        pre_building_dedup, len(scored), len(scored),
+        filter_result.after_budget, filter_result.after_min_budget, filter_result.after_fee,
+        enriched_count, pre_building_dedup, len(scored), len(scored),
     )
 
     # Pick hero photos via vision model (graceful fallback to photos[0])
@@ -555,6 +557,16 @@ def _trim_amenity_cache(state: ChatState) -> None:
         del state.amenity_cache[lid]
 
 
+def _normalize_hood(name: str) -> str:
+    """Normalize a neighborhood name to its canonical form (lowered).
+
+    Resolves aliases in both directions: sub-areas map to parent neighborhoods
+    AND non-canonical variants map to config canonical names.
+    """
+    lower = name.lower()
+    return NEIGHBORHOOD_ALIASES.get(lower, lower)
+
+
 def _neighborhood_pre_filter(
     listings: list[Listing],
     prefs: Preferences,
@@ -565,27 +577,32 @@ def _neighborhood_pre_filter(
     RECOMMENDED sort ignores the areas filter, returning ~98% wrong-area results.
     This pre-filter compensates for that specific API bug.
 
-    Uses NEIGHBORHOOD_ALIASES to handle StreetEasy naming variants
-    (e.g. "West Chelsea" matches "Chelsea" in preferences).
+    Normalizes BOTH preference names and listing names to canonical forms via
+    NEIGHBORHOOD_ALIASES before matching. This handles bidirectional aliases:
+    e.g. user says "Gramercy Park" and listing says "Gramercy" (or vice versa).
 
     If no neighborhoods are set in preferences, all listings pass through.
     """
     if not prefs.neighborhoods:
         return listings
 
-    # Build a set of canonical neighborhood names (lowered) from preferences
-    pref_hoods_lower = {n.lower() for n in prefs.neighborhoods}
+    # Normalize preference neighborhoods to canonical names
+    pref_canonical = set()
+    for name in prefs.neighborhoods:
+        pref_canonical.add(_normalize_hood(name))
+        # Also add the raw lowered name for direct matches
+        pref_canonical.add(name.lower())
 
     result = []
     for listing in listings:
         hood_lower = listing.neighborhood.lower()
-        # Direct match
-        if hood_lower in pref_hoods_lower:
+        # Direct match against raw or canonical preference names
+        if hood_lower in pref_canonical:
             result.append(listing)
             continue
-        # Alias match: check if listing's neighborhood maps to a preferred one
-        canonical = NEIGHBORHOOD_ALIASES.get(hood_lower)
-        if canonical and canonical in pref_hoods_lower:
+        # Normalize listing neighborhood and check
+        canonical = _normalize_hood(listing.neighborhood)
+        if canonical in pref_canonical:
             result.append(listing)
 
     return result
@@ -642,21 +659,34 @@ def _filter_over_budget(
 ) -> list[Listing]:
     """Drop listings that clearly exceed the user's budget.
 
-    Uses net_effective_price when available (accounts for free months).
-    Borderline cases (gross over but net under) are kept for LLM judgment.
+    Keeps a listing if EITHER gross price or net_effective_price is within budget.
+    This handles edge cases where net > gross (rare) and gross > net (free months).
     If no budget_max is set, all listings pass through.
     """
     if not prefs.budget_max:
         return listings
     result = []
     for l in listings:
-        effective = l.net_effective_price or l.price
-        if effective <= prefs.budget_max:
+        if l.price <= prefs.budget_max:
             result.append(l)
         elif l.net_effective_price and l.net_effective_price <= prefs.budget_max:
             # Gross over, net under — keep for LLM judgment
             result.append(l)
     return result
+
+
+def _filter_under_budget(
+    listings: list[Listing],
+    prefs: Preferences,
+) -> list[Listing]:
+    """Drop listings significantly below the user's minimum budget.
+
+    Filters out suspiciously cheap listings (often stale or scam postings).
+    If no budget_min is set, all listings pass through.
+    """
+    if not prefs.budget_min:
+        return listings
+    return [l for l in listings if l.price >= prefs.budget_min]
 
 
 def _filter_stale_listings(listings: list[Listing]) -> list[Listing]:
@@ -686,7 +716,8 @@ def _apply_pre_filters(listings: list[Listing], prefs: Preferences) -> FilterRes
     after_baths = _filter_wrong_bathrooms(after_beds, prefs)
     after_stale = _filter_stale_listings(after_baths)
     after_budget = _filter_over_budget(after_stale, prefs)
-    after_fee = _filter_broker_fee(after_budget, prefs)
+    after_min_budget = _filter_under_budget(after_budget, prefs)
+    after_fee = _filter_broker_fee(after_min_budget, prefs)
     return FilterResult(
         listings=after_fee,
         after_hood=len(after_hood),
@@ -694,6 +725,7 @@ def _apply_pre_filters(listings: list[Listing], prefs: Preferences) -> FilterRes
         after_baths=len(after_baths),
         after_stale=len(after_stale),
         after_budget=len(after_budget),
+        after_min_budget=len(after_min_budget),
         after_fee=len(after_fee),
     )
 
@@ -718,8 +750,7 @@ def _cap_per_building(listings: list[Listing]) -> list[Listing]:
 
 def _canonical_neighborhood(hood: str) -> str:
     """Get canonical neighborhood name (lowered), resolving aliases."""
-    lower = hood.lower()
-    return NEIGHBORHOOD_ALIASES.get(lower, lower)
+    return _normalize_hood(hood)
 
 
 def _cap_per_neighborhood(listings: list[Listing]) -> list[Listing]:
@@ -886,7 +917,13 @@ def _parse_scoring_response(
         text = text.split("\n", 1)[1]
         text = text.rsplit("```", 1)[0].strip()
 
-    scores = json.loads(text)
+    # Extract JSON array — Claude may prepend/append text around the JSON.
+    # Use raw_decode to parse exactly one JSON value, ignoring trailing text.
+    start = text.find("[")
+    if start == -1:
+        raise ValueError("No JSON array found in scoring response")
+    decoder = json.JSONDecoder()
+    scores, _ = decoder.raw_decode(text, start)
     score_map = {item["id"]: item for item in scores}
 
     # Apply scores and filter

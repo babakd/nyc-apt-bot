@@ -80,9 +80,9 @@ def format_listing_card(listing: Listing, rank: int | None = None) -> str:
     if listing.pros or listing.cons:
         bullet_lines = []
         for p in listing.pros[:MAX_PROS_DISPLAYED]:
-            bullet_lines.append(f"\u25b8 {_escape_html(p)}")
+            bullet_lines.append(f"+ {_escape_html(p)}")
         for c in listing.cons[:MAX_CONS_DISPLAYED]:
-            bullet_lines.append(f"\u25b8 {_escape_html(c)}")
+            bullet_lines.append(f"- {_escape_html(c)}")
         parts.append("\n" + "\n".join(bullet_lines))
 
     # Link
@@ -109,12 +109,15 @@ def format_listing_detail(listing: Listing) -> str:
 
 
 def format_preferences_summary(prefs: Preferences) -> str:
-    """Format current preferences for display."""
+    """Format current preferences for Telegram HTML display."""
     parts = ["<b>🏠 Your Search Preferences</b>\n"]
 
-    if prefs.budget_max:
+    if prefs.budget_max or prefs.budget_min:
         budget = f"${prefs.budget_min:,}" if prefs.budget_min else "$0"
-        budget += f" – ${prefs.budget_max:,}/mo"
+        if prefs.budget_max:
+            budget += f" – ${prefs.budget_max:,}/mo"
+        else:
+            budget += "+/mo"
         parts.append(f"💰 Budget: {budget}")
 
     if prefs.bedrooms:
@@ -124,7 +127,7 @@ def format_preferences_summary(prefs: Preferences) -> str:
         parts.append(f"🛏 Bedrooms: {beds}")
 
     if prefs.neighborhoods:
-        hoods = ", ".join(prefs.neighborhoods[:8])
+        hoods = ", ".join(_escape_html(n) for n in prefs.neighborhoods[:8])
         if len(prefs.neighborhoods) > 8:
             hoods += f" +{len(prefs.neighborhoods) - 8} more"
         parts.append(f"📍 Neighborhoods: {hoods}")
@@ -139,16 +142,64 @@ def format_preferences_summary(prefs: Preferences) -> str:
         parts.append(f"🚿 Min bathrooms: {prefs.min_bathrooms}")
 
     if prefs.must_haves:
-        parts.append(f"✅ Must-haves: {', '.join(prefs.must_haves)}")
+        parts.append(f"✅ Must-haves: {', '.join(_escape_html(m) for m in prefs.must_haves)}")
 
     if prefs.nice_to_haves:
-        parts.append(f"⭐ Nice-to-haves: {', '.join(prefs.nice_to_haves)}")
+        parts.append(f"⭐ Nice-to-haves: {', '.join(_escape_html(n) for n in prefs.nice_to_haves)}")
 
     if prefs.no_fee_only:
         parts.append("🚫 No-fee only")
 
     if prefs.move_in_date:
-        parts.append(f"📅 Move-in: {prefs.move_in_date}")
+        parts.append(f"📅 Move-in: {_escape_html(prefs.move_in_date)}")
+
+    return "\n".join(parts)
+
+
+def format_preferences_summary_plain(prefs: Preferences) -> str:
+    """Format current preferences as plain text (for Claude tool results)."""
+    parts = ["Your Search Preferences:\n"]
+
+    if prefs.budget_max or prefs.budget_min:
+        budget = f"${prefs.budget_min:,}" if prefs.budget_min else "$0"
+        if prefs.budget_max:
+            budget += f" - ${prefs.budget_max:,}/mo"
+        else:
+            budget += "+/mo"
+        parts.append(f"Budget: {budget}")
+
+    if prefs.bedrooms:
+        beds = ", ".join(
+            "Studio" if b == 0 else f"{b} BR" for b in prefs.bedrooms
+        )
+        parts.append(f"Bedrooms: {beds}")
+
+    if prefs.neighborhoods:
+        hoods = ", ".join(prefs.neighborhoods[:8])
+        if len(prefs.neighborhoods) > 8:
+            hoods += f" +{len(prefs.neighborhoods) - 8} more"
+        parts.append(f"Neighborhoods: {hoods}")
+
+    if prefs.commute_address:
+        commute = f"Commute to: {prefs.commute_address}"
+        if prefs.commute_max_minutes:
+            commute += f" (max {prefs.commute_max_minutes} min)"
+        parts.append(commute)
+
+    if prefs.min_bathrooms:
+        parts.append(f"Min bathrooms: {prefs.min_bathrooms}")
+
+    if prefs.must_haves:
+        parts.append(f"Must-haves: {', '.join(prefs.must_haves)}")
+
+    if prefs.nice_to_haves:
+        parts.append(f"Nice-to-haves: {', '.join(prefs.nice_to_haves)}")
+
+    if prefs.no_fee_only:
+        parts.append("No-fee only")
+
+    if prefs.move_in_date:
+        parts.append(f"Move-in: {prefs.move_in_date}")
 
     return "\n".join(parts)
 

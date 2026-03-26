@@ -19,6 +19,7 @@ from src.scanner import (
     SCORE_FLOOR,
     STALE_LISTING_MONTHS,
     ScoringResult,
+    _apply_pre_filters,
     _cap_per_building,
     _cap_per_neighborhood,
     _canonical_neighborhood,
@@ -26,13 +27,16 @@ from src.scanner import (
     _filter_broker_fee,
     _filter_over_budget,
     _filter_stale_listings,
+    _filter_under_budget,
     _filter_wrong_bathrooms,
+    _parse_scoring_response,
     _filter_wrong_bedrooms,
     _get_cached_listings,
     _has_cached_scan,
     _interleave_by_neighborhood,
     _llm_score_listings,
     _neighborhood_pre_filter,
+    _normalize_hood,
     _parse_listing,
     _pick_hero_photos,
     _sample_photo_keys,
@@ -2574,3 +2578,220 @@ class TestEnrichmentIntegration:
             "https://streeteasy.com/building/a/1",
             "https://streeteasy.com/building/b/2",
         ])
+
+
+class TestBidirectionalNeighborhoodAliases:
+    """Bug 2: Neighborhood alias matching should work in both directions."""
+
+    def test_user_pref_gramercy_park_listing_gramercy(self):
+        """User says 'Gramercy Park', listing says 'Gramercy' -> should match."""
+        prefs = Preferences(neighborhoods=["Gramercy Park"])
+        listings = [make_listing("1", neighborhood="Gramercy")]
+        result = _neighborhood_pre_filter(listings, prefs)
+        assert len(result) == 1
+
+    def test_user_pref_gramercy_listing_gramercy_park(self):
+        """User says 'Gramercy', listing says 'Gramercy Park' -> should match."""
+        prefs = Preferences(neighborhoods=["Gramercy"])
+        listings = [make_listing("1", neighborhood="Gramercy Park")]
+        result = _neighborhood_pre_filter(listings, prefs)
+        assert len(result) == 1
+
+    def test_user_pref_yorkville_listing_upper_east_side(self):
+        """User says 'Yorkville', listing says 'Upper East Side' -> should match."""
+        prefs = Preferences(neighborhoods=["Yorkville"])
+        listings = [make_listing("1", neighborhood="Upper East Side")]
+        result = _neighborhood_pre_filter(listings, prefs)
+        assert len(result) == 1
+
+    def test_user_pref_nomad_listing_flatiron(self):
+        """User says 'NoMad', listing says 'Flatiron' -> should match."""
+        prefs = Preferences(neighborhoods=["NoMad"])
+        listings = [make_listing("1", neighborhood="Flatiron")]
+        result = _neighborhood_pre_filter(listings, prefs)
+        assert len(result) == 1
+
+    def test_user_pref_lincoln_square_listing_upper_west_side(self):
+        """User says 'Lincoln Square', listing says 'Upper West Side' -> should match."""
+        prefs = Preferences(neighborhoods=["Lincoln Square"])
+        listings = [make_listing("1", neighborhood="Upper West Side")]
+        result = _neighborhood_pre_filter(listings, prefs)
+        assert len(result) == 1
+
+    def test_normalize_hood_idempotent(self):
+        """Normalizing a canonical name returns itself."""
+        assert _normalize_hood("Chelsea") == "chelsea"
+        assert _normalize_hood("chelsea") == "chelsea"
+
+    def test_normalize_hood_alias(self):
+        """Normalizing an alias returns the canonical name."""
+        assert _normalize_hood("Gramercy Park") == "gramercy"
+        assert _normalize_hood("West Chelsea") == "chelsea"
+        assert _normalize_hood("NoMad") == "flatiron"
+
+    def test_all_aliases_bidirectional(self):
+        """Every alias A->B should result in listings from B matching prefs with A."""
+        for alias_from, alias_to in NEIGHBORHOOD_ALIASES.items():
+            prefs = Preferences(neighborhoods=[alias_from.title()])
+            listings = [make_listing("x", neighborhood=alias_to.title())]
+            result = _neighborhood_pre_filter(listings, prefs)
+            assert len(result) == 1, (
+                f"Alias '{alias_from}' -> '{alias_to}' not bidirectional: "
+                f"user pref='{alias_from.title()}', listing='{alias_to.title()}' should match"
+            )
+
+
+class TestFilterOverBudgetFix:
+    """Bug 4: _filter_over_budget net_effective logic edge cases."""
+
+    def test_gross_under_net_over_kept(self):
+        """Gross=$3800 under budget, net_effective=$4200 over -> kept (gross is under)."""
+        prefs = Preferences(budget_max=4000)
+        listing = make_listing("1", price=3800, net_effective_price=4200)
+        result = _filter_over_budget([listing], prefs)
+        assert len(result) == 1
+
+    def test_gross_over_net_under_kept(self):
+        """Gross=$4500 over budget, net_effective=$3800 under -> kept (net is under)."""
+        prefs = Preferences(budget_max=4000)
+        listing = make_listing("1", price=4500, net_effective_price=3800)
+        result = _filter_over_budget([listing], prefs)
+        assert len(result) == 1
+
+    def test_both_over_excluded(self):
+        """Gross=$4500 and net=$4200, both over budget -> excluded."""
+        prefs = Preferences(budget_max=4000)
+        listing = make_listing("1", price=4500, net_effective_price=4200)
+        result = _filter_over_budget([listing], prefs)
+        assert len(result) == 0
+
+    def test_no_net_gross_under_kept(self):
+        """No net_effective, gross under budget -> kept."""
+        prefs = Preferences(budget_max=4000)
+        listing = make_listing("1", price=3500)
+        result = _filter_over_budget([listing], prefs)
+        assert len(result) == 1
+
+    def test_no_net_gross_over_excluded(self):
+        """No net_effective, gross over budget -> excluded."""
+        prefs = Preferences(budget_max=4000)
+        listing = make_listing("1", price=4500)
+        result = _filter_over_budget([listing], prefs)
+        assert len(result) == 0
+
+
+class TestFilterUnderBudget:
+    """Bug 8: Filter listings below budget_min."""
+
+    def test_under_budget_min_excluded(self):
+        """Listings priced below budget_min are dropped."""
+        prefs = Preferences(budget_min=3000)
+        listings = [
+            make_listing("1", price=500),
+            make_listing("2", price=2999),
+            make_listing("3", price=3000),
+            make_listing("4", price=5000),
+        ]
+        result = _filter_under_budget(listings, prefs)
+        assert len(result) == 2
+        assert {l.listing_id for l in result} == {"3", "4"}
+
+    def test_no_budget_min_passes_all(self):
+        """No budget_min set -> all listings pass."""
+        prefs = Preferences()
+        listings = [make_listing("1", price=100)]
+        result = _filter_under_budget(listings, prefs)
+        assert len(result) == 1
+
+    def test_under_budget_in_pre_filter_chain(self):
+        """_filter_under_budget is part of _apply_pre_filters."""
+        prefs = Preferences(budget_min=3000, neighborhoods=["Chelsea"])
+        listings = [
+            make_listing("1", price=500, neighborhood="Chelsea"),
+            make_listing("2", price=3500, neighborhood="Chelsea"),
+        ]
+        result = _apply_pre_filters(listings, prefs)
+        assert len(result.listings) == 1
+        assert result.listings[0].listing_id == "2"
+        assert result.after_min_budget == 1
+
+
+class TestStateSaveOnEmptyRawListings:
+    """Bug 3: State must be saved when raw_listings is empty after cooldown reset."""
+
+    @pytest.mark.asyncio
+    async def test_save_state_called_on_empty_raw_listings(self):
+        """save_state is called even when search returns 0 raw listings."""
+        state = ChatState(
+            chat_id=1,
+            preferences=Preferences(budget_max=4000, neighborhoods=["Chelsea"]),
+            preferences_ready=True,
+            search_failure_streak=3,
+            search_cooldown_until=datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=[])
+        mock_bot = AsyncMock()
+
+        with patch("src.scanner.save_state") as mock_save:
+            await scan_for_chat(mock_scraper, mock_bot, state, is_daily=False)
+            mock_save.assert_called()
+
+        # Failure streak should be reset
+        assert state.search_failure_streak == 0
+        assert state.search_cooldown_until is None
+
+
+class TestParseScoringResponse:
+    """Bug 11: JSON parse robustness for LLM scoring responses."""
+
+    def test_clean_json(self):
+        listings = [make_listing("1", match_score=None)]
+        result = _parse_scoring_response(
+            '[{"id":"1","include":true,"score":80,"pros":["good"],"cons":[]}]',
+            listings,
+        )
+        assert len(result.listings) == 1
+        assert result.listings[0].match_score == 80
+
+    def test_markdown_code_fences(self):
+        listings = [make_listing("1", match_score=None)]
+        result = _parse_scoring_response(
+            '```json\n[{"id":"1","include":true,"score":85,"pros":[],"cons":[]}]\n```',
+            listings,
+        )
+        assert len(result.listings) == 1
+        assert result.listings[0].match_score == 85
+
+    def test_trailing_text_after_json(self):
+        """Claude sometimes appends commentary after the JSON array."""
+        listings = [make_listing("1", match_score=None), make_listing("2", match_score=None)]
+        result = _parse_scoring_response(
+            '[{"id":"1","include":true,"score":85,"pros":[],"cons":[]},{"id":"2","include":true,"score":70,"pros":[],"cons":[]}]\n\nNote: These scores are based on the criteria.',
+            listings,
+        )
+        assert len(result.listings) == 2
+
+    def test_leading_text_before_json(self):
+        """Claude sometimes prepends text before the JSON array."""
+        listings = [make_listing("1", match_score=None)]
+        result = _parse_scoring_response(
+            'Here are the scores:\n[{"id":"1","include":true,"score":85,"pros":[],"cons":[]}]',
+            listings,
+        )
+        assert len(result.listings) == 1
+
+    def test_brackets_inside_strings(self):
+        """Brackets inside JSON string values don't confuse the parser."""
+        listings = [make_listing("1", match_score=None)]
+        result = _parse_scoring_response(
+            '[{"id":"1","include":true,"score":85,"pros":["Has [nice] amenities"],"cons":[]}]',
+            listings,
+        )
+        assert result.listings[0].pros == ["Has [nice] amenities"]
+
+    def test_no_json_array_raises(self):
+        listings = [make_listing("1", match_score=None)]
+        with pytest.raises(ValueError, match="No JSON array"):
+            _parse_scoring_response("No JSON here", listings)
