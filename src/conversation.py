@@ -9,12 +9,11 @@ from datetime import date
 from typing import Any
 
 from src.claude_client import ChatResult, ClaudeClient
-from src.formatter import _escape_html, format_preferences_summary
+from src.config import MAX_HISTORY_TURNS
+from src.formatter import _escape_html, format_apartment_context, format_preferences_summary
 from src.models import ChatState, ConversationTurn, CurrentApartment, Preferences
 
 logger = logging.getLogger(__name__)
-
-MAX_HISTORY_TURNS = 30
 
 SYSTEM_PROMPT = """\
 You are a friendly, knowledgeable NYC apartment hunting assistant on Telegram. \
@@ -433,6 +432,13 @@ class ConversationEngine:
             "show_current_apartment": lambda inp, res: self._tool_show_current_apartment(),
         }
 
+    def _find_listing(self, listing_id: str) -> Listing | None:
+        """Look up a listing by ID in recent or liked listings."""
+        return (
+            self.state.recent_listings.get(listing_id)
+            or self.state.liked_listings.get(listing_id)
+        )
+
     async def handle_message(self, text: str, sender_name: str | None = None) -> ConversationResult:
         """Handle a user message by sending it to Claude with tools.
 
@@ -534,24 +540,11 @@ class ConversationEngine:
         # Current apartment context
         apt = self.state.current_apartment
         if apt:
-            apt_parts = ["\nCurrent apartment:"]
-            if apt.address:
-                apt_parts.append(f"  Address: {apt.address}")
-            if apt.neighborhood:
-                apt_parts.append(f"  Neighborhood: {apt.neighborhood}")
-            if apt.price:
-                apt_parts.append(f"  Rent: ${apt.price:,}/mo")
-            if apt.bedrooms is not None:
-                apt_parts.append(f"  Bedrooms: {apt.bedrooms}")
-            if apt.move_out_date:
-                apt_parts.append(f"  Moving out: {apt.move_out_date}")
-            if apt.pros:
-                apt_parts.append(f"  Likes: {', '.join(apt.pros)}")
-            if apt.cons:
-                apt_parts.append(f"  Dislikes: {', '.join(apt.cons)}")
-            if apt.notes:
-                apt_parts.append(f"  Notes: {apt.notes}")
-            current_apt_context = "\n".join(apt_parts) + "\n"
+            apt_text = format_apartment_context(apt)
+            if apt_text:
+                current_apt_context = "\nCurrent apartment:\n" + "\n".join(f"  {line}" for line in apt_text.split("\n")) + "\n"
+            else:
+                current_apt_context = ""
         else:
             current_apt_context = ""
 
@@ -731,10 +724,7 @@ class ConversationEngine:
     def _tool_get_listing_details(self, input_data: dict[str, Any]) -> str:
         """Look up full details for a listing."""
         listing_id = input_data.get("listing_id", "")
-        listing = (
-            self.state.recent_listings.get(listing_id)
-            or self.state.liked_listings.get(listing_id)
-        )
+        listing = self._find_listing(listing_id)
         if not listing:
             return (
                 f"Listing {listing_id} not found in recent or liked listings. "
@@ -771,10 +761,7 @@ class ConversationEngine:
         found = []
         not_found = []
         for lid in listing_ids[:5]:
-            listing = (
-                self.state.recent_listings.get(lid)
-                or self.state.liked_listings.get(lid)
-            )
+            listing = self._find_listing(lid)
             if listing:
                 found.append(listing)
             else:
@@ -808,10 +795,7 @@ class ConversationEngine:
     def _tool_draft_outreach(self, input_data: dict[str, Any], result: ConversationResult) -> str:
         """Signal that an outreach draft should be created."""
         listing_id = input_data.get("listing_id", "")
-        listing = (
-            self.state.recent_listings.get(listing_id)
-            or self.state.liked_listings.get(listing_id)
-        )
+        listing = self._find_listing(listing_id)
         if not listing:
             return (
                 f"Listing {listing_id} not found in recent or liked listings. "

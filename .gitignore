@@ -34,6 +34,36 @@ CLAUDE.md
 # Decision docs (local only)
 orchestrator_bug.md
 agent_sdk_tradeoff.md
+rank_problem*.md
+actor_investigation.md
+
+# Diagnostic / experiment scripts (local only)
+diagnose_*.py
+discover_*.py
+intercept_*.py
+inspect_*.py
+extract_from_*.py
+read_secret.py
+
+# Ad-hoc test scripts (local only)
+test_graphql_*.py
+test_rsc_*.py
+test_url_formats.py
+
+# Data / experiment files
+experiment_*.json
+experiment_*.log
+apify_run_*.json
+apify_build_check_*.json
+actor_direct_repro_*.json
+quality_analysis_*.json
+check_apify_builds.py
+
+# Scraped HTML
+streeteasy_*.html
+
+# Raw text dumps
+*_raw.txt
 
 # OS
 .DS_Store

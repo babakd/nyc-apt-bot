@@ -10,7 +10,7 @@ import httpx
 
 from src.conversation import ConversationEngine, Response
 from src.models import ChatState
-from src.storage import chat_lock, load_state, save_state
+from src.storage import chat_lock, load_state, mark_update_seen, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class TelegramBot:
         self._bot_username: str | None = None
 
     def set_scan_callback(self, callback):
-        """Set a callback to trigger apartment scans: async fn(chat_id, state)."""
+        """Set a callback to trigger apartment scans: async fn(chat_id, state, update_id)."""
         self._scan_callback = callback
 
     async def close(self) -> None:
@@ -37,17 +37,30 @@ class TelegramBot:
 
     # --- Incoming Update Processing ---
 
-    async def process_update(self, update: dict[str, Any]) -> None:
+    async def process_update(
+        self,
+        update: dict[str, Any],
+        *,
+        skip_update_dedup: bool = False,
+    ) -> None:
         """Route an incoming Telegram update to the appropriate handler."""
         update_id = update.get("update_id")
-        if update_id is not None:
+        if update_id is not None and not skip_update_dedup:
             if update_id in self._seen_update_ids:
                 logger.debug("Skipping duplicate update_id %s", update_id)
+                return
+            try:
+                is_new = mark_update_seen(update_id)
+            except Exception:
+                logger.exception("Persistent update-id dedup failed for %s", update_id)
+                is_new = True
+            if not is_new:
+                logger.debug("Skipping duplicate update_id %s (persistent dedup)", update_id)
                 return
             self._seen_update_ids.add(update_id)
 
         if "message" in update:
-            await self._handle_message(update["message"])
+            await self._handle_message(update["message"], update_id=update_id)
         elif "callback_query" in update:
             await self._handle_callback_query(update["callback_query"])
         else:
@@ -81,7 +94,12 @@ class TelegramBot:
         chat_type = message.get("chat", {}).get("type", "private")
         return chat_type in ("group", "supergroup")
 
-    async def _handle_message(self, message: dict[str, Any]) -> None:
+    async def _handle_message(
+        self,
+        message: dict[str, Any],
+        *,
+        update_id: int | None = None,
+    ) -> None:
         """Handle an incoming text message via the LLM conversation engine."""
         chat_id = message["chat"]["id"]
         is_group = self._is_group_chat(message)
@@ -158,12 +176,10 @@ class TelegramBot:
             # Send text responses
             await self._send_responses(chat_id, result.responses)
 
-            # Run scan inline — update_id dedup prevents Telegram retries from
-            # causing duplicate messages, and Modal's allow_concurrent_inputs
-            # lets other webhooks proceed while this one waits for Apify.
+            # Run scan callback if the conversation triggered a search.
             if result.trigger_search and self._scan_callback:
                 try:
-                    await self._scan_callback(chat_id, state)
+                    await self._scan_callback(chat_id, state, update_id)
                 except Exception:
                     logger.exception("Scan triggered by conversation failed")
                     await self.send_text(

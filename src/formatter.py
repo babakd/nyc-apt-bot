@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from src.config import MAX_PROS_DISPLAYED, MAX_CONS_DISPLAYED
 from src.models import Listing, Preferences
+
+if TYPE_CHECKING:
+    from src.models import CurrentApartment
 
 
 # --- Inline Keyboard Builders ---
@@ -75,9 +79,9 @@ def format_listing_card(listing: Listing, rank: int | None = None) -> str:
     # Pros/cons as compact bullets
     if listing.pros or listing.cons:
         bullet_lines = []
-        for p in listing.pros[:3]:
+        for p in listing.pros[:MAX_PROS_DISPLAYED]:
             bullet_lines.append(f"\u25b8 {_escape_html(p)}")
-        for c in listing.cons[:2]:
+        for c in listing.cons[:MAX_CONS_DISPLAYED]:
             bullet_lines.append(f"\u25b8 {_escape_html(c)}")
         parts.append("\n" + "\n".join(bullet_lines))
 
@@ -176,6 +180,28 @@ def format_scan_header(count: int, is_daily: bool = True) -> str:
         f"Found <b>{count}</b> new listing{'s' if count != 1 else ''} "
         f"matching your preferences, ranked by match score:"
     )
+
+
+def format_apartment_context(apt: "CurrentApartment") -> str:
+    """Format current apartment info for inclusion in prompts."""
+    parts = []
+    if apt.price:
+        parts.append(f"Current rent: ${apt.price:,}/mo")
+    if apt.neighborhood:
+        parts.append(f"Current neighborhood: {apt.neighborhood}")
+    if apt.bedrooms is not None:
+        parts.append(f"Bedrooms: {apt.bedrooms}")
+    if apt.address:
+        parts.append(f"Address: {apt.address}")
+    if apt.move_out_date:
+        parts.append(f"Moving out: {apt.move_out_date}")
+    if apt.pros:
+        parts.append(f"Likes: {', '.join(apt.pros)}")
+    if apt.cons:
+        parts.append(f"Dislikes: {', '.join(apt.cons)}")
+    if apt.notes:
+        parts.append(f"Notes: {apt.notes}")
+    return "\n".join(parts)
 
 
 # --- Telegram API Payload Builders ---

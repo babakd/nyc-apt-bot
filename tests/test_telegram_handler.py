@@ -353,3 +353,62 @@ class TestDraftEditMessageRouting:
             bot.send_text.assert_called_once()
             sent_text = bot.send_text.call_args[0][1]
             assert "Failed to revise" in sent_text
+
+
+class TestUpdateIdDedup:
+    @pytest.mark.asyncio
+    async def test_process_update_skips_in_memory_duplicate(self, bot):
+        """Second delivery of same update_id is skipped in-process."""
+        update = {
+            "update_id": 999,
+            "message": {
+                "chat": {"id": 123, "type": "private"},
+                "from": {"first_name": "Alice"},
+                "text": "hello",
+            },
+        }
+
+        bot._handle_message = AsyncMock()
+        with patch("src.telegram_handler.mark_update_seen", return_value=True) as mock_mark:
+            await bot.process_update(update)
+            await bot.process_update(update)
+
+        bot._handle_message.assert_called_once()
+        mock_mark.assert_called_once_with(999)
+
+    @pytest.mark.asyncio
+    async def test_process_update_skips_persistent_duplicate(self, bot):
+        """Duplicate update from another container is skipped via persistent marker."""
+        update = {
+            "update_id": 1000,
+            "message": {
+                "chat": {"id": 123, "type": "private"},
+                "from": {"first_name": "Alice"},
+                "text": "hello",
+            },
+        }
+
+        bot._handle_message = AsyncMock()
+        with patch("src.telegram_handler.mark_update_seen", return_value=False):
+            await bot.process_update(update)
+
+        bot._handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_update_can_skip_dedup(self, bot):
+        """Worker path can bypass update-id dedup when already claimed at ingress."""
+        update = {
+            "update_id": 1001,
+            "message": {
+                "chat": {"id": 123, "type": "private"},
+                "from": {"first_name": "Alice"},
+                "text": "hello",
+            },
+        }
+
+        bot._handle_message = AsyncMock()
+        with patch("src.telegram_handler.mark_update_seen", return_value=False) as mock_mark:
+            await bot.process_update(update, skip_update_dedup=True)
+
+        mock_mark.assert_not_called()
+        bot._handle_message.assert_called_once()

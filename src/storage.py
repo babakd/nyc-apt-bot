@@ -7,9 +7,18 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
+from src.config import (
+    APIFY_ACTOR_BUILD_PIN_FILE,
+    APIFY_ACTOR_CANARY_FILE,
+    APIFY_ACTOR_CANARY_URLS_FILE,
+    UPDATE_MARKER_RETENTION,
+    UPDATE_MARKER_PRUNE_EVERY,
+)
 from src.models import ChatState, Preferences
 
 logger = logging.getLogger(__name__)
@@ -26,10 +35,19 @@ async def chat_lock(chat_id: int):
         yield
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
+UPDATE_MARKER_DIRNAME = "telegram_updates"
 
 
 def _state_path(chat_id: int) -> Path:
     return Path(DATA_DIR) / "chats" / f"{chat_id}.json"
+
+
+def _system_path(filename: str) -> Path:
+    return Path(DATA_DIR) / "system" / filename
+
+
+def _configured_path(path_str: str) -> Path:
+    return Path(path_str)
 
 
 def _ensure_dir(path: Path) -> None:
@@ -53,6 +71,20 @@ def _atomic_write(path: Path, data: str) -> None:
         raise
 
 
+def _read_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        logger.exception("Failed to read JSON file: %s", path)
+        return default
+
+
+def _write_json_file(path: Path, payload: Any) -> None:
+    _atomic_write(path, json.dumps(payload, indent=2))
+
+
 def load_state(chat_id: int) -> ChatState:
     """Load chat state from disk. Returns fresh state if not found."""
     path = _state_path(chat_id)
@@ -67,7 +99,6 @@ def load_state(chat_id: int) -> ChatState:
 
 def save_state(state: ChatState) -> None:
     """Persist chat state to disk atomically."""
-    from datetime import datetime, timezone
     state.updated_at = datetime.now(timezone.utc)
     path = _state_path(state.chat_id)
     data = state.model_dump_json(indent=2)
@@ -98,6 +129,123 @@ def list_chat_ids() -> list[int]:
 def load_all_states() -> list[ChatState]:
     """Load all chat states (for daily scan across all users)."""
     return [load_state(cid) for cid in list_chat_ids()]
+
+
+def _update_marker_dir() -> Path:
+    return Path(DATA_DIR) / UPDATE_MARKER_DIRNAME
+
+
+def _prune_update_markers(latest_update_id: int) -> None:
+    """Best-effort cleanup for old update-id markers."""
+    min_keep_id = latest_update_id - UPDATE_MARKER_RETENTION
+    if min_keep_id <= 0:
+        return
+
+    marker_dir = _update_marker_dir()
+    if not marker_dir.exists():
+        return
+
+    for marker in marker_dir.glob("*.seen"):
+        stem = marker.stem
+        if not stem.isdigit():
+            continue
+        try:
+            marker_id = int(stem)
+        except ValueError:
+            continue
+        if marker_id < min_keep_id:
+            try:
+                marker.unlink()
+            except OSError:
+                logger.debug("Failed to prune update marker %s", marker)
+
+
+def mark_update_seen(update_id: int) -> bool:
+    """Atomically mark a Telegram update id as seen.
+
+    Returns True if this is the first time seeing the id, False when duplicate.
+    """
+    marker_dir = _update_marker_dir()
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / f"{update_id}.seen"
+
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+
+    with os.fdopen(fd, "w") as f:
+        f.write(datetime.now(timezone.utc).isoformat())
+
+    if update_id % UPDATE_MARKER_PRUNE_EVERY == 0:
+        _prune_update_markers(update_id)
+
+    return True
+
+
+def load_actor_build_pin() -> str:
+    """Load pinned actor build id from disk. Empty string means no pin."""
+    path = _configured_path(APIFY_ACTOR_BUILD_PIN_FILE)
+    payload = _read_json_file(path, {})
+    build_id = payload.get("build_id")
+    return str(build_id) if build_id else ""
+
+
+def save_actor_build_pin(build_id: str) -> None:
+    """Persist pinned actor build id to disk."""
+    path = _configured_path(APIFY_ACTOR_BUILD_PIN_FILE)
+    _write_json_file(
+        path,
+        {
+            "build_id": build_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def load_canary_status() -> dict[str, Any]:
+    """Load latest actor canary status payload."""
+    path = _configured_path(APIFY_ACTOR_CANARY_FILE)
+    return _read_json_file(path, {})
+
+
+def save_canary_status(payload: dict[str, Any]) -> None:
+    """Persist latest actor canary status payload."""
+    path = _configured_path(APIFY_ACTOR_CANARY_FILE)
+    wrapped = dict(payload)
+    wrapped["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_json_file(path, wrapped)
+
+
+def load_canary_urls() -> list[str]:
+    """Load known-good detail URLs for actor canary checks."""
+    path = _configured_path(APIFY_ACTOR_CANARY_URLS_FILE)
+    payload = _read_json_file(path, {})
+    urls = payload.get("urls")
+    if not isinstance(urls, list):
+        return []
+    return [str(u) for u in urls if isinstance(u, str) and u]
+
+
+def save_canary_urls(urls: list[str], max_urls: int = 100) -> None:
+    """Persist canary detail URLs with stable de-duplication and cap."""
+    unique_urls: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        unique_urls.append(url)
+    unique_urls = unique_urls[:max_urls]
+
+    path = _configured_path(APIFY_ACTOR_CANARY_URLS_FILE)
+    _write_json_file(
+        path,
+        {
+            "urls": unique_urls,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 def clear_all_conversation_histories() -> int:

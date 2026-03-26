@@ -11,6 +11,18 @@ from src.models import ChatState
 def temp_data_dir(monkeypatch, tmp_path):
     """Use a temporary directory for all storage tests."""
     monkeypatch.setattr("src.storage.DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "src.storage.APIFY_ACTOR_BUILD_PIN_FILE",
+        str(tmp_path / "system" / "apify_actor_build_pin.json"),
+    )
+    monkeypatch.setattr(
+        "src.storage.APIFY_ACTOR_CANARY_FILE",
+        str(tmp_path / "system" / "apify_actor_canary_status.json"),
+    )
+    monkeypatch.setattr(
+        "src.storage.APIFY_ACTOR_CANARY_URLS_FILE",
+        str(tmp_path / "system" / "apify_actor_canary_urls.json"),
+    )
     return tmp_path
 
 
@@ -119,3 +131,53 @@ class TestChatLock:
         assert len(ends) == 2
         # Both starts should happen before both ends
         assert max(starts) < max(ends)
+
+
+class TestUpdateIdDedup:
+    def test_mark_update_seen_first_time_true(self):
+        from src.storage import mark_update_seen
+
+        assert mark_update_seen(1001) is True
+
+    def test_mark_update_seen_duplicate_false(self):
+        from src.storage import mark_update_seen
+
+        assert mark_update_seen(2002) is True
+        assert mark_update_seen(2002) is False
+
+    def test_mark_update_seen_prunes_old_markers(self):
+        from src.storage import mark_update_seen
+
+        # 5000-window retention with prune every 100 updates.
+        assert mark_update_seen(1) is True
+        assert mark_update_seen(5100) is True  # triggers prune
+        assert mark_update_seen(1) is True  # marker should have been pruned
+
+
+class TestActorCanaryStorage:
+    def test_actor_build_pin_roundtrip(self):
+        from src.storage import load_actor_build_pin, save_actor_build_pin
+
+        assert load_actor_build_pin() == ""
+        save_actor_build_pin("build-123")
+        assert load_actor_build_pin() == "build-123"
+
+    def test_canary_status_roundtrip(self):
+        from src.storage import load_canary_status, save_canary_status
+
+        payload = {"ok": True, "coverage": 0.97, "requests_failed": 0}
+        save_canary_status(payload)
+        loaded = load_canary_status()
+        assert loaded["ok"] is True
+        assert loaded["coverage"] == 0.97
+        assert loaded["requests_failed"] == 0
+        assert "updated_at" in loaded
+
+    def test_canary_urls_dedup_and_cap(self):
+        from src.storage import load_canary_urls, save_canary_urls
+
+        save_canary_urls(
+            ["u1", "u2", "u1", "u3", "", "u4"],
+            max_urls=3,
+        )
+        assert load_canary_urls() == ["u1", "u2", "u3"]

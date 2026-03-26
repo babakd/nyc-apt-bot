@@ -7,26 +7,27 @@ import base64
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import anthropic
 import httpx
-from apify_client import ApifyClientAsync
 
-from src.formatter import format_listing_card, format_scan_header, listing_keyboard
+from src.config import (
+    SCORING_MODEL, SCORE_FLOOR, CACHE_MAX_AGE_HOURS, AMENITY_CACHE_MAX_ITEMS,
+    AMENITY_TEXT_MAX_LEN, STALE_LISTING_MONTHS, MAX_PER_BUILDING, MAX_PER_NEIGHBORHOOD,
+    MAX_LISTINGS_PER_BATCH, PHOTO_DOWNLOAD_SEMAPHORE, MAX_PROS_DISPLAYED, MAX_CONS_DISPLAYED,
+    MAX_AMENITIES_DISPLAY, AMENITY_REQUIRED_COVERAGE, AMENITY_ENRICHMENT_MAX_WAIT_SECS,
+    AMENITY_ENRICHMENT_NO_ITEMS_ABORT_SECS, SEARCH_FAILURE_STREAK_FOR_COOLDOWN,
+    SEARCH_FAILURE_COOLDOWN_BASE_SECS, SEARCH_FAILURE_COOLDOWN_MAX_SECS,
+)
+from src.formatter import format_apartment_context, format_listing_card, format_scan_header, listing_keyboard
 from src.models import MAX_RECENT_LISTINGS, ChatState, CurrentApartment, Listing, Preferences
-from src.apify_scraper import ApifyScraper, ApifyScraperError, STREETEASY_PHOTO_URL, STREETEASY_PHOTO_URL_THUMB
+from src.apify_scraper import ApifyScraper, STREETEASY_PHOTO_URL, STREETEASY_PHOTO_URL_THUMB
 from src.storage import load_all_states, save_state
 
-CACHE_MAX_AGE_HOURS = 48
-
 logger = logging.getLogger(__name__)
-
-SCORING_MODEL = "claude-opus-4-6"
-SCORE_FLOOR = 25
 
 
 @dataclass
@@ -34,6 +35,60 @@ class ScoringResult:
     """Result from LLM scoring, with fallback flag."""
     listings: list[Listing]
     is_fallback: bool = False
+
+
+@dataclass
+class FilterResult:
+    """Result from pre-filter chain with intermediate counts for funnel logging."""
+    listings: list[Listing]
+    after_hood: int = 0
+    after_beds: int = 0
+    after_baths: int = 0
+    after_stale: int = 0
+    after_budget: int = 0
+    after_fee: int = 0
+
+
+def _score_key(listing: Listing) -> int:
+    """Sort key returning match_score (defaulting None to 0)."""
+    return listing.match_score or 0
+
+
+def _cooldown_remaining_secs(state: ChatState, now: datetime) -> int:
+    """Return remaining cooldown seconds (0 when no active cooldown)."""
+    if not state.search_cooldown_until:
+        return 0
+    remaining = int((state.search_cooldown_until - now).total_seconds())
+    return max(0, remaining)
+
+
+def _reset_search_failure_state(state: ChatState) -> None:
+    """Clear consecutive search failure tracking."""
+    state.search_failure_streak = 0
+    state.last_search_failure_at = None
+    state.search_cooldown_until = None
+
+
+def _record_search_failure(state: ChatState, now: datetime) -> tuple[int, int]:
+    """Update search failure counters and cooldown window.
+
+    Returns:
+        tuple[int, int]: (new_streak, applied_cooldown_secs)
+    """
+    state.search_failure_streak = (state.search_failure_streak or 0) + 1
+    state.last_search_failure_at = now
+
+    cooldown_secs = 0
+    if state.search_failure_streak >= SEARCH_FAILURE_STREAK_FOR_COOLDOWN:
+        exponent = state.search_failure_streak - SEARCH_FAILURE_STREAK_FOR_COOLDOWN
+        cooldown_secs = min(
+            SEARCH_FAILURE_COOLDOWN_BASE_SECS * (2 ** exponent),
+            SEARCH_FAILURE_COOLDOWN_MAX_SECS,
+        )
+        state.search_cooldown_until = now + timedelta(seconds=cooldown_secs)
+
+    return state.search_failure_streak, cooldown_secs
+
 
 # Neighborhood alias map: StreetEasy naming variants → canonical preference name.
 # Used by _neighborhood_pre_filter to match listings whose neighborhood names
@@ -106,11 +161,49 @@ async def scan_for_chat(
     prefs = state.preferences
     logger.info("Scanning for chat %s with prefs: %s", state.chat_id, prefs.neighborhoods)
 
+    now = datetime.now(timezone.utc)
+    cooldown_remaining = _cooldown_remaining_secs(state, now)
+    if cooldown_remaining > 0:
+        logger.warning(
+            "Search suppressed by cooldown: chat_id=%s streak=%d remaining_secs=%d",
+            state.chat_id,
+            state.search_failure_streak,
+            cooldown_remaining,
+        )
+        if is_daily:
+            await telegram_bot.send_text(
+                state.chat_id,
+                "StreetEasy is temporarily blocking requests. I'll retry on the next scan.",
+            )
+        else:
+            wait_minutes = max(1, cooldown_remaining // 60)
+            await telegram_bot.send_text(
+                state.chat_id,
+                f"StreetEasy is temporarily blocking requests. Please retry in about {wait_minutes} minute(s).",
+            )
+        save_state(state)
+        return
+
     # Search StreetEasy via Apify actor (with retry)
     try:
         raw_listings = await scraper.search_with_retry(prefs)
+        if state.search_failure_streak or state.search_cooldown_until:
+            logger.info(
+                "Search recovered: chat_id=%s previous_streak=%d",
+                state.chat_id,
+                state.search_failure_streak,
+            )
+            _reset_search_failure_state(state)
     except Exception:
+        failure_time = datetime.now(timezone.utc)
+        streak, cooldown_secs = _record_search_failure(state, failure_time)
         logger.exception("StreetEasy search failed")
+        logger.warning(
+            "Search failure recorded: chat_id=%s streak=%d cooldown_secs=%d",
+            state.chat_id,
+            streak,
+            cooldown_secs,
+        )
         # Try cache fallback
         if _has_cached_scan(state):
             cached = _get_cached_listings(state)
@@ -138,22 +231,26 @@ async def scan_for_chat(
                             card_text,
                             keyboard=keyboard,
                         )
+                save_state(state)
                 return
         await telegram_bot.send_text(
             state.chat_id,
             "\u26a0\ufe0f I had trouble searching StreetEasy today. I'll try again tomorrow.",
         )
+        save_state(state)
         return
 
     if not raw_listings:
         await telegram_bot.send_text(state.chat_id, format_scan_header(0, is_daily=is_daily))
         return
 
-    # Deduplicate (check only — marking as seen happens after successful send)
+    # Deduplicate by listing_id within this run, and drop already-seen listings.
     new_listings = []
+    seen_in_run: set[str] = set()
     for raw in raw_listings:
         lid = str(raw.get("listing_id", ""))
-        if lid and lid not in state.seen_listing_ids:
+        if lid and lid not in state.seen_listing_ids and lid not in seen_in_run:
+            seen_in_run.add(lid)
             new_listings.append(raw)
 
     if not new_listings:
@@ -170,11 +267,12 @@ async def scan_for_chat(
             logger.exception("Failed to parse listing %s", raw.get("listing_id"))
             continue
 
-    # Layer 1: Neighborhood pre-filter (data quality fix for StreetEasy's broken RECOMMENDED sort)
-    filtered = _neighborhood_pre_filter(parsed, prefs)
+    # Layer 1: Local pre-filters (compensate for path/pipe URL limitations)
+    filter_result = _apply_pre_filters(parsed, prefs)
+    filtered = filter_result.listings
 
     if not filtered and parsed:
-        logger.info("All %d listings filtered out by neighborhood pre-filter", len(parsed))
+        logger.info("All %d listings filtered out by local pre-filters", len(parsed))
         if is_daily:
             msg = "\ud83d\udd0d No listings found in your neighborhoods today. I'll check again tomorrow!"
         else:
@@ -183,15 +281,105 @@ async def scan_for_chat(
         save_state(state)
         return
 
-    # Enrich with amenities/description from listing pages
-    filtered = await _enrich_listings(filtered)
+    # Layer 1.5: Amenity enrichment via detail pages (skip if no amenity prefs)
+    enriched_count = 0
+    amenity_coverage = 1.0
+    amenity_failure_reason: str | None = None
+    if (prefs.must_haves or prefs.nice_to_haves) and filtered:
+        cache_hits = 0
+        to_fetch_urls: list[str] = []
+        url_to_id: dict[str, str] = {}
+
+        for listing in filtered:
+            cached = state.amenity_cache.get(listing.listing_id)
+            if cached:
+                _apply_amenity_data(listing, cached)
+                enriched_count += 1
+                cache_hits += 1
+            elif listing.url:
+                to_fetch_urls.append(listing.url)
+                url_to_id[listing.url] = listing.listing_id
+
+        try:
+            if to_fetch_urls:
+                enrichment_result = await scraper.enrich_with_amenities(
+                    to_fetch_urls,
+                    url_to_id,
+                    max_total_wait_secs=AMENITY_ENRICHMENT_MAX_WAIT_SECS,
+                    required_coverage=AMENITY_REQUIRED_COVERAGE,
+                    no_items_abort_secs=AMENITY_ENRICHMENT_NO_ITEMS_ABORT_SECS,
+                )
+                amenity_data = enrichment_result.data_by_listing_id
+                if enrichment_result.failed:
+                    amenity_failure_reason = enrichment_result.failure_reason
+            else:
+                amenity_data = {}
+                enrichment_result = None
+
+            for listing in filtered:
+                data = amenity_data.get(listing.listing_id)
+                if not data:
+                    continue
+                _apply_amenity_data(listing, data)
+                state.amenity_cache[listing.listing_id] = data
+                enriched_count += 1
+
+            _trim_amenity_cache(state)
+            amenity_coverage = enriched_count / len(filtered)
+
+            logger.info(
+                "Amenity enrichment: cache_hits=%d fetched=%d enriched=%d/%d coverage=%.1f%%",
+                cache_hits,
+                len(amenity_data),
+                enriched_count,
+                len(filtered),
+                amenity_coverage * 100,
+            )
+            logger.info(
+                "Amenity send decision: coverage=%.3f threshold=%.3f send_allowed=%s failure_reason=%s",
+                amenity_coverage,
+                AMENITY_REQUIRED_COVERAGE,
+                amenity_coverage >= AMENITY_REQUIRED_COVERAGE and not amenity_failure_reason,
+                amenity_failure_reason or "",
+            )
+        except Exception:
+            logger.exception("Amenity enrichment failed")
+            amenity_failure_reason = "enrichment_exception"
+
+        if amenity_failure_reason or amenity_coverage < AMENITY_REQUIRED_COVERAGE:
+            if is_daily:
+                await telegram_bot.send_text(
+                    state.chat_id,
+                    "Today's scan couldn't verify amenities reliably; I'll try again next run.",
+                )
+            else:
+                await telegram_bot.send_text(
+                    state.chat_id,
+                    "Couldn't verify amenities reliably right now. Please retry shortly.",
+                )
+            save_state(state)
+            return
 
     # Layer 2: LLM filter + score
     scoring_result = await _llm_score_listings(filtered, prefs, state.current_apartment)
     scored = scoring_result.listings
 
-    # Sort by score descending
-    scored.sort(key=lambda l: l.match_score or 0, reverse=True)
+    # Sort by score descending, then apply diversity caps
+    scored.sort(key=_score_key, reverse=True)
+    pre_building_dedup = len(scored)
+    scored = _cap_per_building(scored)
+    scored = _cap_per_neighborhood(scored)
+    scored = _interleave_by_neighborhood(scored)
+
+    # Funnel logging
+    logger.info(
+        "Scan funnel for chat %s: Raw=%d | Dedup=%d | Hood=%d | Beds=%d | Baths=%d | "
+        "Stale=%d | Budget=%d | Fee=%d | Enriched=%d | LLM=%d | Bldg=%d | Sent=%d",
+        state.chat_id, len(raw_listings), len(new_listings), filter_result.after_hood,
+        filter_result.after_beds, filter_result.after_baths, filter_result.after_stale,
+        filter_result.after_budget, filter_result.after_fee, enriched_count,
+        pre_building_dedup, len(scored), len(scored),
+    )
 
     # Pick hero photos via vision model (graceful fallback to photos[0])
     hero_photos = await _pick_hero_photos(scored)
@@ -262,6 +450,12 @@ def _parse_listing(raw: dict) -> Listing:
         bathrooms=float(raw.get("bathrooms", 1)),
         sqft=raw.get("sqft"),
         amenities=raw.get("amenities", []),
+        matched_amenities=raw.get("matched_amenities", []),
+        missing_amenities=raw.get("missing_amenities", []),
+        confirmed_building_amenities=raw.get("confirmed_building_amenities", []),
+        confirmed_unit_features=raw.get("confirmed_unit_features", []),
+        amenity_text_dump=raw.get("amenity_text_dump"),
+        amenity_signal_status=raw.get("amenity_signal_status"),
         photos=raw.get("photos", []),
         photo_keys=raw.get("photo_keys", []),
         broker_fee=raw.get("broker_fee"),
@@ -291,164 +485,74 @@ def _get_cached_listings(state: ChatState) -> list[Listing]:
     return result
 
 
-def _extract_listing_detail(html: str) -> tuple[list[str], str | None]:
-    """Extract amenities and description from a StreetEasy listing page HTML.
+def _build_amenity_text_dump(
+    building_amenities: list[str],
+    unit_features: list[str],
+    description: str | None,
+) -> str:
+    """Build a short amenity evidence summary for LLM scoring."""
+    parts = []
+    if building_amenities:
+        parts.append("Building: " + ", ".join(building_amenities[:MAX_AMENITIES_DISPLAY]))
+    if unit_features:
+        parts.append("Unit: " + ", ".join(unit_features[:MAX_AMENITIES_DISPLAY]))
+    if description:
+        desc = description.strip()
+        if len(desc) > 140:
+            desc = desc[:140]
+        parts.append("Description: " + desc)
+    return " | ".join(parts)[:AMENITY_TEXT_MAX_LEN]
 
-    Tries __NEXT_DATA__ JSON first, then falls back to JSON-LD structured data.
-    Returns (amenities, description).
-    """
-    amenities: list[str] = []
-    description: str | None = None
 
-    # Try __NEXT_DATA__ (Next.js data)
-    next_data_match = re.search(
-        r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
-        html,
-        re.DOTALL,
+def _derive_amenity_signal_status(
+    building_amenities: list[str],
+    unit_features: list[str],
+    description: str | None,
+) -> str:
+    """Classify amenity evidence completeness."""
+    has_structured = bool(building_amenities or unit_features)
+    has_text = bool(description and description.strip())
+    if has_structured:
+        return "present"
+    if has_text:
+        return "partial"
+    return "missing"
+
+
+def _apply_amenity_data(listing: Listing, data: dict[str, Any]) -> None:
+    """Apply enrichment payload to a listing and derive contract fields."""
+    building = list(data.get("building_amenities", []))
+    unit = list(data.get("unit_features", []))
+    description = data.get("description")
+
+    listing.building_amenities = building
+    listing.unit_features = unit
+    listing.confirmed_building_amenities = building
+    listing.confirmed_unit_features = unit
+
+    if description and not listing.description:
+        listing.description = description
+
+    listing.amenity_signal_status = _derive_amenity_signal_status(
+        building,
+        unit,
+        listing.description,
     )
-    if next_data_match:
-        try:
-            data = json.loads(next_data_match.group(1))
-            # Navigate to listing props — structure: props.pageProps.listingData or similar
-            props = data.get("props", {}).get("pageProps", {})
-            # Try common paths for listing data
-            listing_data = props.get("listingData") or props.get("listing") or {}
-            if isinstance(listing_data, dict):
-                # Amenities
-                raw_amenities = listing_data.get("amenities") or listing_data.get("amenityList") or []
-                if isinstance(raw_amenities, list):
-                    for item in raw_amenities:
-                        if isinstance(item, str):
-                            amenities.append(item)
-                        elif isinstance(item, dict):
-                            name = item.get("name") or item.get("label") or ""
-                            if name:
-                                amenities.append(name)
-                # Description
-                desc = listing_data.get("description") or listing_data.get("listingDescription") or ""
-                if desc and isinstance(desc, str):
-                    description = desc.strip()
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            pass
-
-    # Fallback: JSON-LD structured data
-    if not amenities and not description:
-        ld_match = re.search(
-            r'<script\s+type="application/ld\+json">(.*?)</script>',
-            html,
-            re.DOTALL,
-        )
-        if ld_match:
-            try:
-                ld_data = json.loads(ld_match.group(1))
-                if isinstance(ld_data, list):
-                    ld_data = ld_data[0] if ld_data else {}
-                if isinstance(ld_data, dict):
-                    # Schema.org Apartment/Residence
-                    raw_amenities = ld_data.get("amenityFeature") or []
-                    if isinstance(raw_amenities, list):
-                        for item in raw_amenities:
-                            if isinstance(item, str):
-                                amenities.append(item)
-                            elif isinstance(item, dict):
-                                name = item.get("name") or item.get("value") or ""
-                                if name:
-                                    amenities.append(name)
-                    desc = ld_data.get("description") or ""
-                    if desc and isinstance(desc, str):
-                        description = desc.strip()
-            except (json.JSONDecodeError, AttributeError, TypeError):
-                pass
-
-    return amenities, description
+    listing.amenity_text_dump = _build_amenity_text_dump(
+        building,
+        unit,
+        listing.description,
+    )
 
 
-async def _enrich_listings(listings: list[Listing]) -> list[Listing]:
-    """Enrich listings with amenities and descriptions from individual listing pages.
-
-    Uses Apify's cheerio-scraper actor to fetch listing pages through residential proxies
-    (direct HTTP to streeteasy.com returns 403 from Imperva).
-
-    Gracefully degrades: if enrichment fails for individual listings or entirely,
-    the pipeline continues with unenriched data.
-    """
-    if not listings:
-        return listings
-
-    token = os.environ.get("APIFY_API_TOKEN", "")
-    if not token:
-        logger.warning("No APIFY_API_TOKEN, skipping enrichment")
-        return listings
-
-    urls = []
-    url_to_listing: dict[str, Listing] = {}
-    for listing in listings:
-        if listing.url:
-            urls.append(listing.url)
-            url_to_listing[listing.url] = listing
-
-    if not urls:
-        return listings
-
-    logger.info("Enriching %d listings via Apify cheerio-scraper", len(urls))
-
-    try:
-        client = ApifyClientAsync(token=token)
-        run_input = {
-            "startUrls": [{"url": u} for u in urls],
-            "maxConcurrency": 3,
-            "maxRequestRetries": 2,
-            "pageFunction": """async function pageFunction(context) {
-                return {
-                    url: context.request.url,
-                    html: context.body,
-                };
-            }""",
-            "proxy": {
-                "useApifyProxy": True,
-                "apifyProxyGroups": ["RESIDENTIAL"],
-                "countryCode": "US",
-            },
-        }
-
-        run = await client.actor("apify/cheerio-scraper").call(
-            run_input=run_input,
-            timeout_secs=120,
-            memory_mbytes=512,
-        )
-
-        if not run or run.get("status") != "SUCCEEDED":
-            logger.warning("Enrichment actor run failed: %s", run)
-            return listings
-
-        dataset = client.dataset(run["defaultDatasetId"])
-        result = await dataset.list_items()
-
-        enriched_count = 0
-        for item in result.items:
-            page_url = item.get("url", "")
-            html = item.get("html", "")
-            if not html or page_url not in url_to_listing:
-                continue
-
-            listing = url_to_listing[page_url]
-            try:
-                page_amenities, page_description = _extract_listing_detail(html)
-                if page_amenities and not listing.amenities:
-                    listing.amenities = page_amenities
-                if page_description and not listing.description:
-                    listing.description = page_description
-                if page_amenities or page_description:
-                    enriched_count += 1
-            except Exception:
-                logger.debug("Failed to parse enrichment for %s", listing.listing_id)
-
-        logger.info("Enriched %d/%d listings with amenities/description", enriched_count, len(listings))
-
-    except Exception:
-        logger.exception("Listing enrichment failed, continuing with unenriched data")
-
-    return listings
+def _trim_amenity_cache(state: ChatState) -> None:
+    """Bound amenity cache size in state."""
+    if len(state.amenity_cache) <= AMENITY_CACHE_MAX_ITEMS:
+        return
+    overflow = len(state.amenity_cache) - AMENITY_CACHE_MAX_ITEMS
+    old_ids = list(state.amenity_cache.keys())[:overflow]
+    for lid in old_ids:
+        del state.amenity_cache[lid]
 
 
 def _neighborhood_pre_filter(
@@ -487,29 +591,218 @@ def _neighborhood_pre_filter(
     return result
 
 
-async def _llm_score_listings(
+def _filter_wrong_bedrooms(
     listings: list[Listing],
     prefs: Preferences,
-    current_apartment: CurrentApartment | None = None,
-) -> ScoringResult:
-    """Score and filter listings using Claude.
+) -> list[Listing]:
+    """Drop listings with wrong bedroom count.
 
-    Two-step process:
-    1. Check hard constraints → include: true/false
-    2. Score soft preferences → 0-100
+    Compensates for path URLs not filtering by bedrooms.
+    If no bedrooms preference is set, all listings pass through.
+    """
+    if not prefs.bedrooms:
+        return listings
+    allowed = set(prefs.bedrooms)
+    return [l for l in listings if l.bedrooms in allowed]
 
-    Uses constraint_context from preferences to determine what's a dealbreaker
-    vs a nice-to-have. When constraint_context is None, the LLM uses its own judgment.
 
-    Returns only listings with include=true AND score >= SCORE_FLOOR.
-    If all listings are excluded, returns top 3 by score as fallback.
+def _filter_wrong_bathrooms(
+    listings: list[Listing],
+    prefs: Preferences,
+) -> list[Listing]:
+    """Drop listings with fewer bathrooms than the user requires.
+
+    This is a local hard filter that compensates for the rented Apify actor
+    silently dropping the baths URL param.
+
+    If min_bathrooms is not set, all listings pass through.
+    """
+    if not prefs.min_bathrooms:
+        return listings
+    return [l for l in listings if l.bathrooms >= prefs.min_bathrooms]
+
+
+def _filter_broker_fee(
+    listings: list[Listing],
+    prefs: Preferences,
+) -> list[Listing]:
+    """Drop listings with broker fees when user requires no-fee only.
+
+    Compensates for the rented Apify actor ignoring the no_fee URL param.
+    If no_fee_only is False, all listings pass through.
+    """
+    if not prefs.no_fee_only:
+        return listings
+    return [l for l in listings if l.broker_fee is None]
+
+
+def _filter_over_budget(
+    listings: list[Listing],
+    prefs: Preferences,
+) -> list[Listing]:
+    """Drop listings that clearly exceed the user's budget.
+
+    Uses net_effective_price when available (accounts for free months).
+    Borderline cases (gross over but net under) are kept for LLM judgment.
+    If no budget_max is set, all listings pass through.
+    """
+    if not prefs.budget_max:
+        return listings
+    result = []
+    for l in listings:
+        effective = l.net_effective_price or l.price
+        if effective <= prefs.budget_max:
+            result.append(l)
+        elif l.net_effective_price and l.net_effective_price <= prefs.budget_max:
+            # Gross over, net under — keep for LLM judgment
+            result.append(l)
+    return result
+
+
+def _filter_stale_listings(listings: list[Listing]) -> list[Listing]:
+    """Drop listings with available_date more than STALE_LISTING_MONTHS in the past.
+
+    Listings with no available_date or unparseable dates pass through.
+    """
+    cutoff = date.today() - timedelta(days=STALE_LISTING_MONTHS * 30)
+    result = []
+    for listing in listings:
+        if not listing.available_date:
+            result.append(listing)
+            continue
+        try:
+            avail = date.fromisoformat(listing.available_date)
+            if avail >= cutoff:
+                result.append(listing)
+        except (ValueError, TypeError):
+            result.append(listing)
+    return result
+
+
+def _apply_pre_filters(listings: list[Listing], prefs: Preferences) -> FilterResult:
+    """Run all local pre-filters and return results with intermediate counts."""
+    after_hood = _neighborhood_pre_filter(listings, prefs)
+    after_beds = _filter_wrong_bedrooms(after_hood, prefs)
+    after_baths = _filter_wrong_bathrooms(after_beds, prefs)
+    after_stale = _filter_stale_listings(after_baths)
+    after_budget = _filter_over_budget(after_stale, prefs)
+    after_fee = _filter_broker_fee(after_budget, prefs)
+    return FilterResult(
+        listings=after_fee,
+        after_hood=len(after_hood),
+        after_beds=len(after_beds),
+        after_baths=len(after_baths),
+        after_stale=len(after_stale),
+        after_budget=len(after_budget),
+        after_fee=len(after_fee),
+    )
+
+
+def _extract_building_address(address: str) -> str:
+    """Extract building address from full address: '123 Main St #4A' -> '123 main st'."""
+    return address.split("#")[0].strip().lower()
+
+
+def _cap_per_building(listings: list[Listing]) -> list[Listing]:
+    """Cap to MAX_PER_BUILDING listings per building. Assumes sorted by score desc."""
+    building_counts: dict[str, int] = {}
+    result = []
+    for listing in listings:
+        building = _extract_building_address(listing.address)
+        count = building_counts.get(building, 0)
+        if count < MAX_PER_BUILDING:
+            result.append(listing)
+            building_counts[building] = count + 1
+    return result
+
+
+def _canonical_neighborhood(hood: str) -> str:
+    """Get canonical neighborhood name (lowered), resolving aliases."""
+    lower = hood.lower()
+    return NEIGHBORHOOD_ALIASES.get(lower, lower)
+
+
+def _cap_per_neighborhood(listings: list[Listing]) -> list[Listing]:
+    """Cap to MAX_PER_NEIGHBORHOOD listings per canonical neighborhood.
+
+    Prevents one neighborhood from dominating results (e.g. Lincoln Square
+    was 47% of results). Assumes input sorted by score descending.
+    Uses NEIGHBORHOOD_ALIASES for canonical grouping.
+    """
+    hood_counts: dict[str, int] = {}
+    result = []
+    for listing in listings:
+        canonical = _canonical_neighborhood(listing.neighborhood)
+        count = hood_counts.get(canonical, 0)
+        if count < MAX_PER_NEIGHBORHOOD:
+            result.append(listing)
+            hood_counts[canonical] = count + 1
+    return result
+
+
+def _interleave_by_neighborhood(listings: list[Listing]) -> list[Listing]:
+    """Round-robin interleave listings across neighborhoods.
+
+    Ensures the user sees variety in the first few listings rather than
+    a cluster from one neighborhood. Neighborhoods are ordered by their
+    best listing score (descending).
     """
     if not listings:
-        return ScoringResult(listings=listings)
+        return listings
 
-    # Format listings compactly
+    # Group by canonical neighborhood, preserving per-group order
+    groups: dict[str, list[Listing]] = {}
+    for listing in listings:
+        canonical = _canonical_neighborhood(listing.neighborhood)
+        if canonical not in groups:
+            groups[canonical] = []
+        groups[canonical].append(listing)
+
+    # Order neighborhoods by best score (first element, since input is score-sorted)
+    sorted_hoods = sorted(
+        groups.keys(),
+        key=lambda h: _score_key(groups[h][0]),
+        reverse=True,
+    )
+
+    # Round-robin across neighborhoods
+    result: list[Listing] = []
+    indices = {h: 0 for h in sorted_hoods}
+    while len(result) < len(listings):
+        added_any = False
+        for hood in sorted_hoods:
+            idx = indices[hood]
+            if idx < len(groups[hood]):
+                result.append(groups[hood][idx])
+                indices[hood] = idx + 1
+                added_any = True
+        if not added_any:
+            break
+
+    return result
+
+
+def _format_listings_for_scoring(listings: list[Listing]) -> list[dict[str, Any]]:
+    """Prepare listing data as compact dicts for the LLM scoring prompt."""
     listings_data = []
     for l in listings:
+        confirmed_building = (
+            l.confirmed_building_amenities if l.confirmed_building_amenities else l.building_amenities
+        )
+        confirmed_unit = (
+            l.confirmed_unit_features if l.confirmed_unit_features else l.unit_features
+        )
+        amenity_text_dump = l.amenity_text_dump or _build_amenity_text_dump(
+            confirmed_building,
+            confirmed_unit,
+            l.description,
+        )
+        amenity_signal_status = l.amenity_signal_status or _derive_amenity_signal_status(
+            confirmed_building,
+            confirmed_unit,
+            l.description,
+        )
+
         entry: dict[str, Any] = {
             "id": l.listing_id,
             "address": l.address,
@@ -525,6 +818,17 @@ async def _llm_score_listings(
             entry["avail"] = l.available_date
         if l.amenities:
             entry["amenities"] = l.amenities
+        if confirmed_building:
+            entry["confirmed_building_amenities"] = confirmed_building
+        if confirmed_unit:
+            entry["confirmed_unit_features"] = confirmed_unit
+        if amenity_text_dump:
+            entry["amenity_text_dump"] = amenity_text_dump
+        entry["amenity_signal_status"] = amenity_signal_status
+        if l.matched_amenities:
+            entry["has_amenities"] = l.matched_amenities
+        if l.missing_amenities:
+            entry["missing_amenities"] = l.missing_amenities
         if l.description:
             entry["desc"] = l.description[:300]
         if l.net_effective_price and l.net_effective_price != l.price:
@@ -535,8 +839,11 @@ async def _llm_score_listings(
         if canonical:
             entry["hood_canonical"] = canonical.title()
         listings_data.append(entry)
+    return listings_data
 
-    # Format preferences
+
+def _format_preferences_for_scoring(prefs: Preferences) -> str:
+    """Format preferences as plain text for the LLM scoring prompt."""
     pref_lines = []
     if prefs.budget_min or prefs.budget_max:
         if prefs.budget_max:
@@ -564,7 +871,99 @@ async def _llm_score_listings(
         pref_lines.append(commute)
     if prefs.move_in_date:
         pref_lines.append(f"Move-in: {prefs.move_in_date}")
-    prefs_text = "\n".join(pref_lines) if pref_lines else "No specific preferences."
+    return "\n".join(pref_lines) if pref_lines else "No specific preferences."
+
+
+def _parse_scoring_response(
+    response_text: str,
+    listings: list[Listing],
+) -> ScoringResult:
+    """Parse LLM scoring JSON, apply scores, filter by include + score floor."""
+    text = response_text.strip()
+
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        text = text.rsplit("```", 1)[0].strip()
+
+    scores = json.loads(text)
+    score_map = {item["id"]: item for item in scores}
+
+    # Apply scores and filter
+    for listing in listings:
+        scored = score_map.get(listing.listing_id)
+        if scored:
+            listing.match_score = max(0, min(100, scored.get("score", 50)))
+            listing.pros = scored.get("pros", [])[:MAX_PROS_DISPLAYED]
+            listing.cons = scored.get("cons", [])[:MAX_CONS_DISPLAYED]
+        else:
+            # LLM omitted this listing — include with default score
+            listing.match_score = 50
+
+    # Filter: only include listings where LLM said include=true AND score >= SCORE_FLOOR
+    included = []
+    for listing in listings:
+        scored_data = score_map.get(listing.listing_id)
+        # If LLM omitted it, default to include=True
+        llm_include = scored_data.get("include", True) if scored_data else True
+        passes = llm_include and _score_key(listing) >= SCORE_FLOOR
+        if passes:
+            included.append(listing)
+
+        # Per-listing decision logging
+        canonical = NEIGHBORHOOD_ALIASES.get(listing.neighborhood.lower())
+        hood_display = f"{listing.neighborhood}\u2192{canonical.title()}" if canonical else listing.neighborhood
+        decision = "INCLUDED" if passes else "EXCLUDED"
+        logger.info(
+            "Listing %s [%s, $%s, %s]: include=%s score=%s -> %s",
+            listing.listing_id,
+            hood_display,
+            f"{listing.price:,}",
+            listing.address,
+            llm_include,
+            listing.match_score,
+            decision,
+        )
+
+    logger.info(
+        "LLM scoring: %d/%d included (floor=%d)",
+        len(included),
+        len(listings),
+        SCORE_FLOOR,
+    )
+
+    # Fallback: if all excluded, return top 3 by score
+    if not included and listings:
+        listings.sort(key=_score_key, reverse=True)
+        included = listings[:3]
+        logger.info("All listings excluded by LLM filter, returning top 3 as fallback")
+        return ScoringResult(listings=included, is_fallback=True)
+
+    return ScoringResult(listings=included)
+
+
+async def _llm_score_listings(
+    listings: list[Listing],
+    prefs: Preferences,
+    current_apartment: CurrentApartment | None = None,
+) -> ScoringResult:
+    """Score and filter listings using Claude.
+
+    Two-step process:
+    1. Check hard constraints → include: true/false
+    2. Score soft preferences → 0-100
+
+    Uses constraint_context from preferences to determine what's a dealbreaker
+    vs a nice-to-have. When constraint_context is None, the LLM uses its own judgment.
+
+    Returns only listings with include=true AND score >= SCORE_FLOOR.
+    If all listings are excluded, returns top 3 by score as fallback.
+    """
+    if not listings:
+        return ScoringResult(listings=listings)
+
+    listings_data = _format_listings_for_scoring(listings)
+    prefs_text = _format_preferences_for_scoring(prefs)
 
     # Constraint context
     constraint_text = ""
@@ -577,17 +976,9 @@ async def _llm_score_listings(
     # Current apartment context
     apt_text = ""
     if current_apartment:
-        apt_parts = []
-        if current_apartment.price:
-            apt_parts.append(f"Current rent: ${current_apartment.price:,}/mo")
-        if current_apartment.neighborhood:
-            apt_parts.append(f"Current neighborhood: {current_apartment.neighborhood}")
-        if current_apartment.pros:
-            apt_parts.append(f"Likes: {', '.join(current_apartment.pros)}")
-        if current_apartment.cons:
-            apt_parts.append(f"Dislikes: {', '.join(current_apartment.cons)}")
-        if apt_parts:
-            apt_text = "\nCurrent apartment:\n" + "\n".join(apt_parts)
+        apt_text = format_apartment_context(current_apartment)
+        if apt_text:
+            apt_text = "\nCurrent apartment:\n" + apt_text
 
     prompt = (
         f"Today's date is {date.today().isoformat()}.\n\n"
@@ -614,10 +1005,25 @@ async def _llm_score_listings(
         "Adjacent neighborhoods to preferred areas are good, not zero. "
         "When 'hood_canonical' is provided, it means this listing's neighborhood is a "
         "sub-area of the user's preferred neighborhood. Treat it as matching.\n"
-        "Use the amenities list and description to evaluate must-haves and nice-to-haves. "
-        "If amenities data is missing for a listing, do NOT penalize it — assume unknown.\n"
+        "Amenity data sources (in order of reliability):\n"
+        "1. 'confirmed_building_amenities' and 'confirmed_unit_features' — confirmed by StreetEasy detail pages. "
+        "confirmed_building_amenities = building-level (Doorman, Gym, Elevator, Laundry in Building, etc.). "
+        "confirmed_unit_features = unit-specific (Dishwasher, In-unit Laundry, Central AC, etc.). "
+        "When these are present, use them to evaluate must-haves and nice-to-haves. "
+        "A confirmed must-have should boost the score significantly. "
+        "A must-have NOT in either list is likely absent — reduce score accordingly.\n"
+        "2. 'has_amenities' / 'missing_amenities' — from search API annotation (when available). "
+        "Same reliability as above but from a different data source.\n"
+        "3. 'amenity_signal_status' summarizes confidence: present (structured), partial (text-only), missing (none). "
+        "'amenity_text_dump' is a compact evidence summary. Use both to calibrate confidence.\n"
+        "4. When no amenity fields are present — no amenity data available. "
+        "Do not assume amenities are missing. Infer cautiously from building type, price, "
+        "and neighborhood. A $15k/mo luxury high-rise almost certainly has doorman and gym. "
+        "Score based on structural data (price, beds, baths, location) when amenity data "
+        "is unavailable.\n"
         "When a listing has a net_effective price (from free months), use that for budget "
-        "comparison, not the gross price.\n"
+        "comparison, not the gross price. A listing at $4,500/mo gross with 2 months free "
+        "has a net effective of ~$3,750/mo — that's the real cost.\n"
         "Must-haves matter more than nice-to-haves. "
         "2-3 pros, 1-2 cons per listing. Return ONLY the JSON array."
     )
@@ -633,67 +1039,7 @@ async def _llm_score_listings(
             messages=[{"role": "user", "content": prompt}],
         )
 
-        text = response.content[0].text.strip()
-
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            text = text.rsplit("```", 1)[0].strip()
-
-        scores = json.loads(text)
-        score_map = {item["id"]: item for item in scores}
-
-        # Apply scores and filter
-        for listing in listings:
-            scored = score_map.get(listing.listing_id)
-            if scored:
-                listing.match_score = max(0, min(100, scored.get("score", 50)))
-                listing.pros = scored.get("pros", [])[:3]
-                listing.cons = scored.get("cons", [])[:2]
-            else:
-                # LLM omitted this listing — include with default score
-                listing.match_score = 50
-
-        # Filter: only include listings where LLM said include=true AND score >= SCORE_FLOOR
-        included = []
-        for listing in listings:
-            scored_data = score_map.get(listing.listing_id)
-            # If LLM omitted it, default to include=True
-            llm_include = scored_data.get("include", True) if scored_data else True
-            passes = llm_include and (listing.match_score or 0) >= SCORE_FLOOR
-            if passes:
-                included.append(listing)
-
-            # Per-listing decision logging
-            canonical = NEIGHBORHOOD_ALIASES.get(listing.neighborhood.lower())
-            hood_display = f"{listing.neighborhood}\u2192{canonical.title()}" if canonical else listing.neighborhood
-            decision = "INCLUDED" if passes else "EXCLUDED"
-            logger.info(
-                "Listing %s [%s, $%s, %s]: include=%s score=%s -> %s",
-                listing.listing_id,
-                hood_display,
-                f"{listing.price:,}",
-                listing.address,
-                llm_include,
-                listing.match_score,
-                decision,
-            )
-
-        logger.info(
-            "LLM scoring: %d/%d included (floor=%d)",
-            len(included),
-            len(listings),
-            SCORE_FLOOR,
-        )
-
-        # Fallback: if all excluded, return top 3 by score
-        if not included and listings:
-            listings.sort(key=lambda l: l.match_score or 0, reverse=True)
-            included = listings[:3]
-            logger.info("All listings excluded by LLM filter, returning top 3 as fallback")
-            return ScoringResult(listings=included, is_fallback=True)
-
-        return ScoringResult(listings=included)
+        return _parse_scoring_response(response.content[0].text, listings)
 
     except Exception:
         logger.exception("LLM scoring failed, returning listings unscored")
@@ -757,7 +1103,7 @@ async def _vision_pick_heroes(listings: list[Listing]) -> dict[str, str]:
         ]
 
     # Download all thumbnails in parallel with semaphore
-    sem = asyncio.Semaphore(20)
+    sem = asyncio.Semaphore(PHOTO_DOWNLOAD_SEMAPHORE)
     all_urls: list[tuple[str, str, str]] = []  # (listing_id, key, url)
     for lid, pairs in download_plan.items():
         for key, url in pairs:
@@ -791,7 +1137,6 @@ async def _vision_pick_heroes(listings: list[Listing]) -> dict[str, str]:
 
     # Batch viable listings to stay under Claude API's 100-image limit
     # 12 listings × 8 photos = 96 images max per batch
-    MAX_LISTINGS_PER_BATCH = 12
     viable_ids = list(viable.keys())
     hero_map: dict[str, str] = {}
 

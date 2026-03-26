@@ -9,20 +9,7 @@ import pytest
 from src.claude_client import ChatResult
 from src.models import ChatState, Draft, Listing, Preferences
 from src.outreach import DEFAULT_TEMPLATE, create_draft, revise_draft
-
-
-def _make_listing(**kwargs) -> Listing:
-    defaults = dict(
-        listing_id="100",
-        url="https://streeteasy.com/rental/100",
-        address="100 Main St #2A",
-        neighborhood="Chelsea",
-        price=3500,
-        bedrooms=2,
-        bathrooms=1.0,
-    )
-    defaults.update(kwargs)
-    return Listing(**defaults)
+from tests.conftest import make_listing
 
 
 @pytest.fixture
@@ -43,7 +30,7 @@ class TestCreateDraft:
     @pytest.mark.asyncio
     async def test_extracts_text_from_chat_result(self, mock_bot, mock_state):
         """create_draft extracts .text from ChatResult returned by claude.chat()."""
-        listing = _make_listing()
+        listing = make_listing("100", address="100 Main St #2A", neighborhood="Chelsea", price=3500)
         mock_claude = AsyncMock()
         mock_claude.chat = AsyncMock(
             return_value=ChatResult(text="Hi, I'm interested in the apartment.")
@@ -61,7 +48,7 @@ class TestCreateDraft:
     @pytest.mark.asyncio
     async def test_fallback_on_empty_text(self, mock_bot, mock_state):
         """When Claude returns empty text, the default template is used."""
-        listing = _make_listing()
+        listing = make_listing("100", address="100 Main St #2A", neighborhood="Chelsea", price=3500)
         mock_claude = AsyncMock()
         mock_claude.chat = AsyncMock(return_value=ChatResult(text=""))
 
@@ -77,7 +64,7 @@ class TestCreateDraft:
     @pytest.mark.asyncio
     async def test_fallback_on_api_exception(self, mock_bot, mock_state):
         """When Claude API raises, the default template is used."""
-        listing = _make_listing()
+        listing = make_listing("100", address="100 Main St #2A", neighborhood="Chelsea", price=3500)
         mock_claude = AsyncMock()
         mock_claude.chat = AsyncMock(side_effect=Exception("API error"))
 
@@ -101,7 +88,7 @@ class TestReviseDraft:
             message_text="Original message",
         )
         state.active_drafts["d1"] = draft
-        listing = _make_listing()
+        listing = make_listing("100", address="100 Main St #2A", neighborhood="Chelsea", price=3500)
         state.recent_listings["100"] = listing
 
         mock_claude = AsyncMock()

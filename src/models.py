@@ -47,6 +47,14 @@ class Listing(BaseModel):
     bathrooms: float
     sqft: Optional[int] = None
     amenities: list[str] = Field(default_factory=list)
+    matched_amenities: list[str] = Field(default_factory=list)
+    missing_amenities: list[str] = Field(default_factory=list)
+    building_amenities: list[str] = Field(default_factory=list)
+    unit_features: list[str] = Field(default_factory=list)
+    confirmed_building_amenities: list[str] = Field(default_factory=list)
+    confirmed_unit_features: list[str] = Field(default_factory=list)
+    amenity_text_dump: Optional[str] = None
+    amenity_signal_status: Optional[str] = None
     photos: list[str] = Field(default_factory=list, description="Photo URLs")
     photo_keys: list[str] = Field(default_factory=list, description="Raw photo keys for CDN URL construction")
     broker_fee: Optional[str] = None
@@ -96,10 +104,14 @@ class ChatState(BaseModel):
     liked_listing_ids: set[str] = Field(default_factory=set)
     liked_listings: dict[str, Listing] = Field(default_factory=dict)
     recent_listings: dict[str, Listing] = Field(default_factory=dict)
+    amenity_cache: dict[str, dict[str, Any]] = Field(default_factory=dict)
     active_drafts: dict[str, Draft] = Field(default_factory=dict)
     pending_draft_edit: Optional[str] = Field(None)
     current_apartment: Optional[CurrentApartment] = None
     last_scan_listing_ids: list[str] = Field(default_factory=list)
     last_scan_at: Optional[datetime] = None
+    search_failure_streak: int = 0
+    last_search_failure_at: Optional[datetime] = None
+    search_cooldown_until: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

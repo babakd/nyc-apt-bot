@@ -10,6 +10,7 @@ import pytest
 from src.claude_client import ChatResult, ClaudeClient
 from src.conversation import ConversationEngine, ConversationResult, Response
 from src.models import ChatState, ConversationTurn, CurrentApartment, Listing
+from tests.conftest import make_listing
 
 
 @pytest.fixture
@@ -27,22 +28,6 @@ def state_with_prefs():
     return state
 
 
-def _make_listing(listing_id: str, **overrides) -> Listing:
-    """Helper to create a test listing with sensible defaults."""
-    defaults = dict(
-        listing_id=listing_id,
-        url=f"https://streeteasy.com/rental/{listing_id}",
-        address=f"123 Test St #{listing_id}",
-        neighborhood="Chelsea",
-        price=3500,
-        bedrooms=2,
-        bathrooms=1.0,
-        match_score=75,
-    )
-    defaults.update(overrides)
-    return Listing(**defaults)
-
-
 @pytest.fixture
 def state_with_listings():
     """State with recent and liked listings for detail/compare/draft tests."""
@@ -50,9 +35,9 @@ def state_with_listings():
     state.preferences.budget_max = 4000
     state.preferences.neighborhoods = ["Chelsea"]
 
-    l1 = _make_listing("100", address="100 Main St", price=3000, bedrooms=1, neighborhood="Chelsea", match_score=90)
-    l2 = _make_listing("200", address="200 Broadway", price=3800, bedrooms=2, neighborhood="SoHo", match_score=70, broker_fee="Broker fee")
-    l3 = _make_listing("300", address="300 Park Ave", price=4200, bedrooms=2, neighborhood="Gramercy Park", match_score=60)
+    l1 = make_listing("100", address="100 Main St", price=3000, bedrooms=1, neighborhood="Chelsea", match_score=90)
+    l2 = make_listing("200", address="200 Broadway", price=3800, bedrooms=2, neighborhood="SoHo", match_score=70, broker_fee="Broker fee")
+    l3 = make_listing("300", address="300 Park Ave", price=4200, bedrooms=2, neighborhood="Gramercy Park", match_score=60)
 
     state.recent_listings = {"100": l1, "200": l2, "300": l3}
     state.liked_listing_ids = {"100", "200"}

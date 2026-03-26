@@ -7,16 +7,11 @@ import uuid
 from datetime import datetime, timezone
 
 from src.claude_client import ClaudeClient
-from src.formatter import draft_keyboard, format_draft_message
+from src.formatter import _escape_html, draft_keyboard, format_draft_message
 from src.models import ChatState, Draft, Listing
 from src.storage import load_state, save_state
 
 logger = logging.getLogger(__name__)
-
-
-def _escape_html(text: str) -> str:
-    """Escape HTML special characters for Telegram."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # Default message template used as a fallback

@@ -8,35 +8,29 @@ import pytest
 
 from src.models import Listing
 from src.telegraph_pages import create_listing_page
+from tests.conftest import make_listing
 
-
-def _make_listing(**overrides) -> Listing:
-    """Helper to create a test listing with sensible defaults."""
-    defaults = dict(
-        listing_id="999",
-        url="https://streeteasy.com/rental/999",
-        address="123 Test St #4A",
-        neighborhood="East Village",
-        price=3500,
-        bedrooms=2,
-        bathrooms=1.0,
-        match_score=80,
-        photos=["https://streeteasy.imgix.net/image/abc/image.jpg"],
-        pros=["Great location"],
-        cons=["No elevator"],
-        description="A lovely apartment.",
-        amenities=["Dishwasher"],
-        available_date="Mar 1, 2026",
-    )
-    defaults.update(overrides)
-    return Listing(**defaults)
+# Default overrides matching the original telegraph test helper
+_TELEGRAPH_DEFAULTS = dict(
+    listing_id="999",
+    url="https://streeteasy.com/rental/999",
+    address="123 Test St #4A",
+    price=3500,
+    match_score=80,
+    photos=["https://streeteasy.imgix.net/image/abc/image.jpg"],
+    pros=["Great location"],
+    cons=["No elevator"],
+    description="A lovely apartment.",
+    amenities=["Dishwasher"],
+    available_date="Mar 1, 2026",
+)
 
 
 class TestTelegraphEscaping:
     @pytest.mark.asyncio
     async def test_description_html_escaped(self):
         """Description with HTML special chars is escaped."""
-        listing = _make_listing(description="Price < $3000 & very spacious")
+        listing = make_listing(**{**_TELEGRAPH_DEFAULTS, "description": "Price < $3000 & very spacious"})
 
         mock_telegraph = AsyncMock()
         mock_telegraph.create_page = AsyncMock(return_value={"url": "https://telegra.ph/test"})
@@ -52,10 +46,10 @@ class TestTelegraphEscaping:
     @pytest.mark.asyncio
     async def test_pros_cons_html_escaped(self):
         """Pros and cons with special chars are escaped."""
-        listing = _make_listing(
-            pros=["Size > average", "A & B"],
-            cons=["Price < budget"],
-        )
+        listing = make_listing(**{**_TELEGRAPH_DEFAULTS,
+            "pros": ["Size > average", "A & B"],
+            "cons": ["Price < budget"],
+        })
 
         mock_telegraph = AsyncMock()
         mock_telegraph.create_page = AsyncMock(return_value={"url": "https://telegra.ph/test"})
@@ -71,7 +65,7 @@ class TestTelegraphEscaping:
     @pytest.mark.asyncio
     async def test_neighborhood_html_escaped(self):
         """Neighborhood name with special chars is escaped."""
-        listing = _make_listing(neighborhood="Test <Area> & Zone")
+        listing = make_listing(**{**_TELEGRAPH_DEFAULTS, "neighborhood": "Test <Area> & Zone"})
 
         mock_telegraph = AsyncMock()
         mock_telegraph.create_page = AsyncMock(return_value={"url": "https://telegra.ph/test"})
@@ -85,7 +79,7 @@ class TestTelegraphEscaping:
     @pytest.mark.asyncio
     async def test_amenities_html_escaped(self):
         """Amenities with special chars are escaped."""
-        listing = _make_listing(amenities=["Washer & Dryer", "A/C <central>"])
+        listing = make_listing(**{**_TELEGRAPH_DEFAULTS, "amenities": ["Washer & Dryer", "A/C <central>"]})
 
         mock_telegraph = AsyncMock()
         mock_telegraph.create_page = AsyncMock(return_value={"url": "https://telegra.ph/test"})
@@ -100,9 +94,9 @@ class TestTelegraphEscaping:
     @pytest.mark.asyncio
     async def test_photo_url_escaped(self):
         """Photo URLs with special chars are escaped in src attributes."""
-        listing = _make_listing(
-            photos=["https://example.com/image?a=1&b=2"]
-        )
+        listing = make_listing(**{**_TELEGRAPH_DEFAULTS,
+            "photos": ["https://example.com/image?a=1&b=2"],
+        })
 
         mock_telegraph = AsyncMock()
         mock_telegraph.create_page = AsyncMock(return_value={"url": "https://telegra.ph/test"})
@@ -116,7 +110,7 @@ class TestTelegraphEscaping:
     @pytest.mark.asyncio
     async def test_broker_fee_escaped(self):
         """Broker fee string with special chars is escaped."""
-        listing = _make_listing(broker_fee="Fee <special> & tax")
+        listing = make_listing(**{**_TELEGRAPH_DEFAULTS, "broker_fee": "Fee <special> & tax"})
 
         mock_telegraph = AsyncMock()
         mock_telegraph.create_page = AsyncMock(return_value={"url": "https://telegra.ph/test"})
@@ -130,7 +124,7 @@ class TestTelegraphEscaping:
     @pytest.mark.asyncio
     async def test_listing_url_escaped(self):
         """StreetEasy URL with special chars is escaped in href attribute."""
-        listing = _make_listing(url="https://streeteasy.com/rental/999?a=1&b=2")
+        listing = make_listing(**{**_TELEGRAPH_DEFAULTS, "url": "https://streeteasy.com/rental/999?a=1&b=2"})
 
         mock_telegraph = AsyncMock()
         mock_telegraph.create_page = AsyncMock(return_value={"url": "https://telegra.ph/test"})

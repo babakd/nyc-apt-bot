@@ -116,3 +116,70 @@ AMENITIES: dict[str, str] = {
     "New Development": "new_development",
 }
 
+# --- Scoring & Filtering ---
+
+SCORING_MODEL = "claude-opus-4-6"
+SCORE_FLOOR = 25
+
+# --- Scanner Cache ---
+
+CACHE_MAX_AGE_HOURS = 48
+AMENITY_CACHE_MAX_ITEMS = 500
+AMENITY_TEXT_MAX_LEN = 360
+
+# --- Listing Filters ---
+
+STALE_LISTING_MONTHS = 3
+MAX_PER_BUILDING = 2
+MAX_PER_NEIGHBORHOOD = 5
+
+# --- Display Limits ---
+
+MAX_PROS_DISPLAYED = 3
+MAX_CONS_DISPLAYED = 2
+MAX_AMENITIES_DISPLAY = 8
+
+# --- Vision Hero Photos ---
+
+MAX_LISTINGS_PER_BATCH = 12
+PHOTO_DOWNLOAD_SEMAPHORE = 20
+
+# --- Apify Actor Polling ---
+
+POLL_INTERVAL_SECS = 10
+ABORT_AFTER_SECS_NO_ITEMS = 60
+
+# --- Apify Enrichment ---
+
+ENRICHMENT_NO_ITEMS_ABORT_SECS = 120
+ENRICHMENT_MAX_WAIT_SECS = 240
+ENRICHMENT_RETRY_BATCH_SIZE = 25
+ENRICHMENT_TARGET_COVERAGE = 0.95
+ENRICHMENT_MAX_URLS = 120
+
+# --- Strict Amenity Verification ---
+
+AMENITY_REQUIRED_COVERAGE = 0.95
+AMENITY_ENRICHMENT_MAX_WAIT_SECS = 600
+AMENITY_ENRICHMENT_NO_ITEMS_ABORT_SECS = 120
+
+# --- Search Reliability ---
+
+SEARCH_FAILURE_STREAK_FOR_COOLDOWN = 2
+SEARCH_FAILURE_COOLDOWN_BASE_SECS = 180
+SEARCH_FAILURE_COOLDOWN_MAX_SECS = 1800
+
+# --- Actor Build Health / Pinning ---
+
+APIFY_ACTOR_BUILD_PIN_FILE = "/data/system/apify_actor_build_pin.json"
+APIFY_ACTOR_CANARY_FILE = "/data/system/apify_actor_canary_status.json"
+APIFY_ACTOR_CANARY_URLS_FILE = "/data/system/apify_actor_canary_urls.json"
+
+# --- Conversation ---
+
+MAX_HISTORY_TURNS = 30
+
+# --- Storage ---
+
+UPDATE_MARKER_RETENTION = 5000
+UPDATE_MARKER_PRUNE_EVERY = 100

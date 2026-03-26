@@ -462,6 +462,7 @@ class TestScanCache:
         state = ChatState(chat_id=12345)
         assert state.last_scan_listing_ids == []
         assert state.last_scan_at is None
+        assert state.amenity_cache == {}
 
     def test_scan_cache_json_roundtrip(self):
         """Cache fields survive JSON serialization."""
@@ -483,3 +484,99 @@ class TestScanCache:
         state = ChatState.model_validate_json(old_json)
         assert state.last_scan_listing_ids == []
         assert state.last_scan_at is None
+
+
+class TestSearchFailureState:
+    def test_defaults(self):
+        """Search failure tracking defaults are empty."""
+        state = ChatState(chat_id=12345)
+        assert state.search_failure_streak == 0
+        assert state.last_search_failure_at is None
+        assert state.search_cooldown_until is None
+
+    def test_json_roundtrip(self):
+        """Search failure state survives serialization."""
+        now = datetime.now(timezone.utc)
+        state = ChatState(chat_id=12345)
+        state.search_failure_streak = 3
+        state.last_search_failure_at = now
+        state.search_cooldown_until = now + timedelta(minutes=5)
+
+        restored = ChatState.model_validate_json(state.model_dump_json())
+        assert restored.search_failure_streak == 3
+        assert restored.last_search_failure_at is not None
+        assert restored.search_cooldown_until is not None
+
+    def test_backward_compat(self):
+        """Old JSON without search failure state still loads with defaults."""
+        state = ChatState.model_validate_json('{"chat_id": 12345}')
+        assert state.search_failure_streak == 0
+        assert state.last_search_failure_at is None
+        assert state.search_cooldown_until is None
+
+
+class TestBuildingAmenitiesAndUnitFeatures:
+    def test_defaults_to_empty(self):
+        """Amenity evidence fields default to empty values."""
+        listing = Listing(
+            listing_id="1", url="", address="", neighborhood="",
+            price=3000, bedrooms=1, bathrooms=1,
+        )
+        assert listing.building_amenities == []
+        assert listing.unit_features == []
+        assert listing.confirmed_building_amenities == []
+        assert listing.confirmed_unit_features == []
+        assert listing.amenity_text_dump is None
+        assert listing.amenity_signal_status is None
+
+    def test_set_amenity_fields(self):
+        """Amenity fields can be set."""
+        listing = Listing(
+            listing_id="1", url="", address="", neighborhood="",
+            price=3000, bedrooms=1, bathrooms=1,
+            building_amenities=["Doorman", "Gym", "Elevator"],
+            unit_features=["Dishwasher", "In-unit Laundry"],
+            confirmed_building_amenities=["Doorman", "Gym", "Elevator"],
+            confirmed_unit_features=["Dishwasher", "In-unit Laundry"],
+            amenity_text_dump="Building: Doorman, Gym | Unit: Dishwasher",
+            amenity_signal_status="present",
+        )
+        assert listing.building_amenities == ["Doorman", "Gym", "Elevator"]
+        assert listing.unit_features == ["Dishwasher", "In-unit Laundry"]
+        assert listing.confirmed_building_amenities == ["Doorman", "Gym", "Elevator"]
+        assert listing.confirmed_unit_features == ["Dishwasher", "In-unit Laundry"]
+        assert listing.amenity_text_dump == "Building: Doorman, Gym | Unit: Dishwasher"
+        assert listing.amenity_signal_status == "present"
+
+    def test_json_roundtrip(self):
+        """Amenity fields survive JSON serialization."""
+        listing = Listing(
+            listing_id="1", url="https://streeteasy.com/rental/1",
+            address="100 Main St", neighborhood="Chelsea",
+            price=3000, bedrooms=1, bathrooms=1,
+            building_amenities=["Doorman", "Gym"],
+            unit_features=["Dishwasher"],
+            confirmed_building_amenities=["Doorman", "Gym"],
+            confirmed_unit_features=["Dishwasher"],
+            amenity_text_dump="Building: Doorman, Gym | Unit: Dishwasher",
+            amenity_signal_status="present",
+        )
+        data = listing.model_dump_json()
+        restored = Listing.model_validate_json(data)
+        assert restored.building_amenities == ["Doorman", "Gym"]
+        assert restored.unit_features == ["Dishwasher"]
+        assert restored.confirmed_building_amenities == ["Doorman", "Gym"]
+        assert restored.confirmed_unit_features == ["Dishwasher"]
+        assert restored.amenity_text_dump == "Building: Doorman, Gym | Unit: Dishwasher"
+        assert restored.amenity_signal_status == "present"
+
+    def test_backward_compatibility(self):
+        """Old JSON without amenity fields loads correctly."""
+        old_json = '{"listing_id": "1", "url": "", "address": "", "neighborhood": "", "price": 3000, "bedrooms": 1, "bathrooms": 1}'
+        listing = Listing.model_validate_json(old_json)
+        assert listing.building_amenities == []
+        assert listing.unit_features == []
+        assert listing.confirmed_building_amenities == []
+        assert listing.confirmed_unit_features == []
+        assert listing.amenity_text_dump is None
+        assert listing.amenity_signal_status is None
