@@ -83,9 +83,11 @@ class TestActorBuildCanary:
         mock_scraper = MagicMock()
         mock_scraper.enrich_with_amenities = AsyncMock(return_value=_canary_result())
         mock_scraper._latest_build_id = AsyncMock(return_value="new-build")
+        mock_scraper._latest_build_number = AsyncMock(return_value="0.0.42")
+        mock_scraper._build_number_for_id = AsyncMock(return_value="0.0.42")
 
         with (
-            patch("src.storage.load_actor_build_pin", return_value="old-build"),
+            patch("src.storage.load_actor_build_pin", return_value="0.0.40"),
             patch("src.storage.load_canary_urls", return_value=["u1", "u2"]),
             patch("src.storage.save_actor_build_pin") as save_pin,
             patch("src.storage.save_canary_status") as save_status,
@@ -95,9 +97,9 @@ class TestActorBuildCanary:
 
         assert payload["ok"] is True
         assert payload["promotion_applied"] is True
-        assert payload["pin_before"] == "old-build"
-        assert payload["pin_after"] == "new-build"
-        save_pin.assert_called_once_with("new-build")
+        assert payload["pin_before"] == "0.0.40"
+        assert payload["pin_after"] == "0.0.42"
+        save_pin.assert_called_once_with("0.0.42")
         save_status.assert_called_once()
 
     @pytest.mark.asyncio
@@ -107,9 +109,11 @@ class TestActorBuildCanary:
         mock_scraper = MagicMock()
         mock_scraper.enrich_with_amenities = AsyncMock(return_value=_canary_result())
         mock_scraper._latest_build_id = AsyncMock(return_value="new-build")
+        mock_scraper._latest_build_number = AsyncMock(return_value="0.0.42")
+        mock_scraper._build_number_for_id = AsyncMock(return_value="0.0.42")
 
         with (
-            patch("src.storage.load_actor_build_pin", return_value="old-build"),
+            patch("src.storage.load_actor_build_pin", return_value="0.0.40"),
             patch("src.storage.load_canary_urls", return_value=["u1", "u2"]),
             patch("src.storage.save_actor_build_pin") as save_pin,
             patch("src.storage.save_canary_status"),
@@ -119,8 +123,8 @@ class TestActorBuildCanary:
 
         assert payload["ok"] is True
         assert payload["promotion_applied"] is False
-        assert payload["pin_before"] == "old-build"
-        assert payload["pin_after"] == "old-build"
+        assert payload["pin_before"] == "0.0.40"
+        assert payload["pin_after"] == "0.0.40"
         save_pin.assert_not_called()
 
 

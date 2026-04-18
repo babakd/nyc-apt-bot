@@ -486,11 +486,12 @@ class TelegramBot:
             page_url = None
 
         if page_url:
+            from src.formatter import _escape_attr, _escape_html
             await self.send_text(
                 chat_id,
-                f'<b>{listing.address}</b>\n\n'
-                f'<a href="{page_url}">View Full Details (Instant View)</a>\n'
-                f'<a href="{listing.url}">View on StreetEasy</a>',
+                f'<b>{_escape_html(listing.address)}</b>\n\n'
+                f'<a href="{_escape_attr(page_url)}">View Full Details (Instant View)</a>\n'
+                f'<a href="{_escape_attr(listing.url)}">View on StreetEasy</a>',
             )
         else:
             # Fallback: send detailed text

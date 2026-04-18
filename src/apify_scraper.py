@@ -158,19 +158,58 @@ class ApifyScraper:
         self._actor_id = "memo23/apify-streeteasy-cheerio"
 
     async def _latest_build_id(self) -> str:
-        """Resolve actor's current latest build id."""
+        """Resolve actor's current latest build id (Apify internal id, e.g. 'R8oKY...')."""
         actor_data = await self._client.actor(self._actor_id).get()
         tagged = (actor_data or {}).get("taggedBuilds") or {}
         latest = tagged.get("latest") or {}
         return str(latest.get("buildId") or "")
 
+    async def _latest_build_number(self) -> str:
+        """Resolve actor's current latest build version (e.g. '0.0.95').
+
+        Apify's `build=` parameter accepts a tag (e.g. 'latest') or a
+        version number — NOT a build id. We pin on the version so the pin
+        remains usable.
+        """
+        actor_data = await self._client.actor(self._actor_id).get()
+        tagged = (actor_data or {}).get("taggedBuilds") or {}
+        latest = tagged.get("latest") or {}
+        return str(latest.get("buildNumber") or "")
+
+    async def _build_number_for_id(self, build_id: str) -> str:
+        """Look up an Apify build's version number from its internal id."""
+        if not build_id:
+            return ""
+        try:
+            data = await self._client.build(build_id).get()
+        except Exception:
+            return ""
+        return str((data or {}).get("buildNumber") or "")
+
+    @staticmethod
+    def _looks_like_build_id(value: str) -> bool:
+        """Heuristic: Apify build ids are ~17 chars of [A-Za-z0-9], no dots."""
+        return bool(value) and "." not in value and len(value) >= 12
+
     @staticmethod
     def _effective_pin() -> str:
-        """Resolve active pin from env override first, then persisted pin."""
+        """Resolve active pin from env override first, then persisted pin.
+
+        Returns a value safe to pass as Apify `build=` (tag or version like
+        '0.0.95'). If the persisted pin still contains a legacy build id
+        (older deployments saved ids), drop it — Apify will reject it.
+        """
         env_pin = os.environ.get("APIFY_ACTOR_BUILD_PIN", "").strip()
         if env_pin:
             return env_pin
-        return load_actor_build_pin().strip()
+        persisted = load_actor_build_pin().strip()
+        if persisted and ApifyScraper._looks_like_build_id(persisted):
+            logger.warning(
+                "Discarding legacy build-id pin %r (Apify expects tag or version)",
+                persisted,
+            )
+            return ""
+        return persisted
 
     @staticmethod
     def _can_persist_pin() -> bool:
@@ -372,16 +411,17 @@ class ApifyScraper:
                 and self._can_persist_pin()
                 and not force_build
             ):
-                promotion_applied = False
-                promoted_build = run_result.build_id or await self._latest_build_id()
+                # Save the build VERSION number (e.g. '0.0.95'), not the
+                # internal build id — Apify only accepts tag/version in build=.
+                promoted_build = await self._build_number_for_id(run_result.build_id)
+                if not promoted_build:
+                    promoted_build = await self._latest_build_number()
                 if promoted_build and promoted_build != pin_before:
                     save_actor_build_pin(promoted_build)
-                    promotion_applied = True
                     logger.warning(
-                        "Actor build promotion: pin_before=%s tested_latest=%s promotion_applied=%s",
+                        "Actor build promotion: pin_before=%s tested_latest=%s promotion_applied=True",
                         pin_before or "<none>",
                         build_candidate,
-                        promotion_applied,
                     )
                 logger.info(
                     "Actor build fallback result: pin_before=%s tested_latest=%s promotion_applied=%s",
@@ -760,54 +800,95 @@ STREETEASY_PHOTO_URL_THUMB = "https://photos.zillowstatic.com/fp/{key}-se_medium
 def _map_apify_item(item: dict[str, Any]) -> dict[str, Any] | None:
     """Map an Apify actor output item to the raw listing dict format expected by scanner.py.
 
-    The memo23 actor returns GraphQL-shaped items with a nested "node" object:
+    The memo23 actor returns GraphQL-shaped items. Two schemas have been seen:
+
+    Legacy (nested):
       { "node": { "id", "areaName", "price", "bedroomCount", "street", "urlPath", ... } }
+
+    Current (flattened, as of build 0.0.95):
+      { "node___typename": "...", "node_id", "node_areaName", "node_price",
+        "node_bedroomCount", "node_street", "node_urlPath",
+        "node_photos_json": "[{\"key\":\"...\"}, ...]", ... }
+
+    We support both. _g(key) reads either nested-style or flattened-style.
     """
-    node = item.get("node") or item
-    listing_id = str(node.get("id", ""))
+    nested = item.get("node") if isinstance(item.get("node"), dict) else None
+
+    def _g(field: str, default: Any = None) -> Any:
+        if nested is not None and field in nested:
+            return nested.get(field, default)
+        flat_key = "node_" + field
+        if flat_key in item:
+            return item.get(flat_key, default)
+        if field in item:
+            return item.get(field, default)
+        return default
+
+    listing_id = str(_g("id", "") or "")
     if not listing_id:
         return None
 
-    # Build listing URL from urlPath (e.g. "/building/ray-harlem/15r")
-    url_path = node.get("urlPath", "")
+    url_path = _g("urlPath", "") or ""
     listing_url = f"https://streeteasy.com{url_path}" if url_path else ""
 
-    # Address from street + unit
-    street = node.get("street", "")
-    unit = node.get("unit", "")
+    street = _g("street", "") or ""
+    unit = _g("unit", "") or ""
     address = f"{street} #{unit}".strip(" #") if street else f"Listing {listing_id}"
 
-    # Photos: array of {"key": "abc123"} -> full image URLs + raw keys
-    photos = []
-    photo_keys = []
-    for photo in node.get("photos") or []:
-        key = photo.get("key") if isinstance(photo, dict) else None
-        if key:
+    # Photos: legacy returns a list under node.photos; flattened serializes to
+    # node_photos_json (a JSON string).
+    photo_dicts: list[dict[str, Any]] = []
+    raw_photos = _g("photos")
+    if isinstance(raw_photos, list):
+        photo_dicts = [p for p in raw_photos if isinstance(p, dict)]
+    else:
+        photos_json = _g("photos_json")
+        if isinstance(photos_json, str) and photos_json:
+            try:
+                import json as _json
+                parsed = _json.loads(photos_json)
+                if isinstance(parsed, list):
+                    photo_dicts = [p for p in parsed if isinstance(p, dict)]
+            except Exception:
+                photo_dicts = []
+    # Fall back to the lead media photo key when photos array is missing.
+    if not photo_dicts:
+        lead_key = _g("leadMedia_photo_key") or _g("leadMediaPhotoKey")
+        if isinstance(lead_key, str) and lead_key:
+            photo_dicts = [{"key": lead_key}]
+
+    photos: list[str] = []
+    photo_keys: list[str] = []
+    for p in photo_dicts:
+        key = p.get("key")
+        if isinstance(key, str) and key:
             photos.append(STREETEASY_PHOTO_URL.format(key=key))
             photo_keys.append(key)
 
-    # Bathrooms: full + half
-    full_bath = int(node.get("fullBathroomCount", 0) or 0)
-    half_bath = int(node.get("halfBathroomCount", 0) or 0)
+    full_bath = int(_g("fullBathroomCount", 0) or 0)
+    half_bath = int(_g("halfBathroomCount", 0) or 0)
     bathrooms = full_bath + 0.5 * half_bath if (full_bath or half_bath) else 1.0
 
-    # Square footage
-    living_area = node.get("livingAreaSize", 0) or 0
+    living_area = _g("livingAreaSize", 0) or 0
     sqft = int(living_area) if living_area else None
+
+    no_fee = bool(_g("noFee", False))
+    net_effective = _g("netEffectivePrice")
+    months_free = _g("monthsFree")
 
     return {
         "listing_id": listing_id,
         "url": listing_url,
         "address": address,
-        "neighborhood": node.get("areaName", ""),
-        "price": int(node.get("price", 0) or 0),
-        "bedrooms": int(node.get("bedroomCount", 0) or 0),
+        "neighborhood": _g("areaName", "") or "",
+        "price": int(_g("price", 0) or 0),
+        "bedrooms": int(_g("bedroomCount", 0) or 0),
         "bathrooms": bathrooms,
         "sqft": sqft,
         "photos": photos,
         "photo_keys": photo_keys,
-        "available_date": node.get("availableAt"),
-        "broker_fee": None if node.get("noFee", False) else "Broker fee",
-        "net_effective_price": int(node.get("netEffectivePrice")) if node.get("netEffectivePrice") else None,
-        "months_free": float(node.get("monthsFree")) if node.get("monthsFree") else None,
+        "available_date": _g("availableAt"),
+        "broker_fee": None if no_fee else "Broker fee",
+        "net_effective_price": int(net_effective) if net_effective else None,
+        "months_free": float(months_free) if months_free else None,
     }

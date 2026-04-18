@@ -5,7 +5,6 @@ from __future__ import annotations
 # --- Bot Constants ---
 
 CONTAINER_IDLE_TIMEOUT = 300
-SCAN_CRON_SCHEDULE = "0 8 * * *"
 DATA_DIR = "/data"
 
 # --- StreetEasy URLs ---
@@ -118,7 +117,8 @@ AMENITIES: dict[str, str] = {
 
 # --- Scoring & Filtering ---
 
-SCORING_MODEL = "claude-opus-4-6"
+SCORING_MODEL = "claude-opus-4-7"
+VISION_MODEL = "claude-haiku-4-5-20251001"
 SCORE_FLOOR = 25
 
 # --- Scanner Cache ---
@@ -174,6 +174,10 @@ SEARCH_FAILURE_COOLDOWN_MAX_SECS = 1800
 APIFY_ACTOR_BUILD_PIN_FILE = "/data/system/apify_actor_build_pin.json"
 APIFY_ACTOR_CANARY_FILE = "/data/system/apify_actor_canary_status.json"
 APIFY_ACTOR_CANARY_URLS_FILE = "/data/system/apify_actor_canary_urls.json"
+
+# --- Telegraph ---
+
+TELEGRAPH_ACCOUNT_FILE = "/data/system/telegraph_account.json"
 
 # --- Conversation ---
 

@@ -16,6 +16,7 @@ from src.config import (
     APIFY_ACTOR_BUILD_PIN_FILE,
     APIFY_ACTOR_CANARY_FILE,
     APIFY_ACTOR_CANARY_URLS_FILE,
+    TELEGRAPH_ACCOUNT_FILE,
     UPDATE_MARKER_RETENTION,
     UPDATE_MARKER_PRUNE_EVERY,
 )
@@ -164,6 +165,9 @@ def mark_update_seen(update_id: int) -> bool:
     """Atomically mark a Telegram update id as seen.
 
     Returns True if this is the first time seeing the id, False when duplicate.
+    Triggers pruning when the marker directory grows past a soft cap so we
+    don't accumulate stale files indefinitely (Telegram update_ids are sparse,
+    so a modulo-based trigger is unreliable).
     """
     marker_dir = _update_marker_dir()
     marker_dir.mkdir(parents=True, exist_ok=True)
@@ -177,7 +181,16 @@ def mark_update_seen(update_id: int) -> bool:
     with os.fdopen(fd, "w") as f:
         f.write(datetime.now(timezone.utc).isoformat())
 
-    if update_id % UPDATE_MARKER_PRUNE_EVERY == 0:
+    should_prune = update_id % UPDATE_MARKER_PRUNE_EVERY == 0
+    if not should_prune:
+        try:
+            marker_count = sum(1 for _ in marker_dir.glob("*.seen"))
+            if marker_count > UPDATE_MARKER_RETENTION + UPDATE_MARKER_PRUNE_EVERY:
+                should_prune = True
+        except OSError:
+            logger.debug("Failed to count update markers for prune check")
+
+    if should_prune:
         _prune_update_markers(update_id)
 
     return True
@@ -227,6 +240,18 @@ def load_canary_urls() -> list[str]:
     return [str(u) for u in urls if isinstance(u, str) and u]
 
 
+def load_telegraph_account() -> dict[str, Any]:
+    """Load persisted Telegraph account credentials. Empty dict if absent."""
+    return _read_json_file(_configured_path(TELEGRAPH_ACCOUNT_FILE), {})
+
+
+def save_telegraph_account(payload: dict[str, Any]) -> None:
+    """Persist Telegraph account credentials (access_token, short_name, etc.)."""
+    wrapped = dict(payload)
+    wrapped["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_json_file(_configured_path(TELEGRAPH_ACCOUNT_FILE), wrapped)
+
+
 def save_canary_urls(urls: list[str], max_urls: int = 100) -> None:
     """Persist canary detail URLs with stable de-duplication and cap."""
     unique_urls: list[str] = []
@@ -248,18 +273,3 @@ def save_canary_urls(urls: list[str], max_urls: int = 100) -> None:
     )
 
 
-def clear_all_conversation_histories() -> int:
-    """Clear conversation history for all chats. Returns count of chats cleared.
-
-    One-time migration helper to flush poisoned history that taught Claude
-    to skip tool calls.
-    """
-    count = 0
-    for chat_id in list_chat_ids():
-        state = load_state(chat_id)
-        if state.conversation_history:
-            state.conversation_history.clear()
-            save_state(state)
-            count += 1
-            logger.info("Cleared conversation history for chat %s", chat_id)
-    return count

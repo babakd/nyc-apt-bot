@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -11,8 +12,39 @@ import anthropic
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-4-6"
+DEFAULT_MODEL = "claude-opus-4-7"
 MAX_TOOL_ITERATIONS = 10
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2.0
+
+
+async def call_with_retry(
+    coro_factory: Callable[[], Any],
+    *,
+    label: str = "anthropic",
+    max_retries: int = MAX_RETRIES,
+    base_delay: float = RETRY_BASE_DELAY,
+):
+    """Retry an Anthropic API call on transient errors with exponential backoff."""
+    transient = (
+        anthropic.RateLimitError,
+        anthropic.APIConnectionError,
+        anthropic.APITimeoutError,
+        anthropic.InternalServerError,
+    )
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_factory()
+        except transient as e:
+            if attempt >= max_retries:
+                logger.warning("%s: giving up after %d attempts: %s", label, attempt + 1, e)
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                "%s: transient error on attempt %d/%d (%s); retrying in %.1fs",
+                label, attempt + 1, max_retries + 1, type(e).__name__, delay,
+            )
+            await asyncio.sleep(delay)
 
 
 @dataclass
@@ -66,13 +98,26 @@ class ClaudeClient:
         new_messages: list[dict[str, Any]] = []
         all_text_parts: list[str] = []
 
+        # Cache the system prompt + tool definitions block. Tools are large and
+        # static across turns; the system prompt only changes when prefs do.
+        system_param: Any = [
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+        ]
+        tools_param: list[dict[str, Any]] = list(tools)
+        if tools_param:
+            tools_param = [dict(t) for t in tools_param]
+            tools_param[-1]["cache_control"] = {"type": "ephemeral"}
+
         for _iteration in range(MAX_TOOL_ITERATIONS):
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                system=system,
-                messages=working_messages,
-                tools=tools,
+            response = await call_with_retry(
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=2048,
+                    system=system_param,
+                    messages=working_messages,
+                    tools=tools_param,
+                ),
+                label="claude.chat",
             )
 
             # Collect text and tool_use blocks

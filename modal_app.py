@@ -288,7 +288,7 @@ async def process_telegram_update(data: dict):
     schedule=modal.Cron("30 16 * * *"),
 )
 async def daily_scan():
-    """Run daily at 8 AM — scan StreetEasy for all registered chats."""
+    """Run daily at 16:30 UTC (12:30pm EDT / 11:30am EST) — scan StreetEasy for all registered chats."""
     from src.apify_scraper import ApifyScraper
     from src.scanner import run_daily_scan
     from src.telegram_handler import TelegramBot
@@ -379,13 +379,19 @@ async def _run_actor_build_canary_once() -> dict[str, object]:
             requests_succeeded > 0 or not has_request_counts
         )
 
-        latest_build = ""
+        latest_build_id = ""
         for summary in result.run_summaries:
             if summary.build_id:
-                latest_build = summary.build_id
+                latest_build_id = summary.build_id
                 break
-        if not latest_build:
-            latest_build = await scraper._latest_build_id()
+        if not latest_build_id:
+            latest_build_id = await scraper._latest_build_id()
+
+        # Resolve the build VERSION number — Apify accepts version in build=,
+        # not the internal id.
+        latest_build_number = await scraper._build_number_for_id(latest_build_id)
+        if not latest_build_number:
+            latest_build_number = await scraper._latest_build_number()
 
         canary_ok = (
             not result.failed
@@ -396,18 +402,18 @@ async def _run_actor_build_canary_once() -> dict[str, object]:
         env_pin_override = os.environ.get("APIFY_ACTOR_BUILD_PIN", "").strip()
         promotion_applied = False
         pin_after = pin_before
-        if canary_ok and latest_build:
+        if canary_ok and latest_build_number:
             if env_pin_override:
                 logger.info(
                     "Actor canary pass but env pin override is active; skipping promotion "
-                    "(pin_before=%s latest_build=%s)",
+                    "(pin_before=%s latest_build_number=%s)",
                     pin_before or "<none>",
-                    latest_build,
+                    latest_build_number,
                 )
             else:
-                pin_after = latest_build
-                if latest_build != pin_before:
-                    save_actor_build_pin(latest_build)
+                pin_after = latest_build_number
+                if latest_build_number != pin_before:
+                    save_actor_build_pin(latest_build_number)
                     promotion_applied = True
 
         status_payload = {
@@ -424,7 +430,8 @@ async def _run_actor_build_canary_once() -> dict[str, object]:
             "requests_failed": requests_failed,
             "has_request_counts": has_request_counts,
             "tested_latest": "latest",
-            "latest_build_id": latest_build,
+            "latest_build_id": latest_build_id,
+            "latest_build_number": latest_build_number,
             "run_summaries": [
                 {
                     "run_id": summary.run_id,
@@ -450,7 +457,7 @@ async def _run_actor_build_canary_once() -> dict[str, object]:
                 result.coverage,
                 AMENITY_REQUIRED_COVERAGE,
                 pin_before or "<none>",
-                latest_build or "<unknown>",
+                latest_build_number or "<unknown>",
                 promotion_applied,
             )
         else:
@@ -461,7 +468,7 @@ async def _run_actor_build_canary_once() -> dict[str, object]:
                 AMENITY_REQUIRED_COVERAGE,
                 request_health_good,
                 pin_before or "<none>",
-                latest_build or "<unknown>",
+                latest_build_number or "<unknown>",
                 promotion_applied,
                 result.failure_reason or "",
             )

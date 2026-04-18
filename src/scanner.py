@@ -14,8 +14,9 @@ from typing import Any
 import anthropic
 import httpx
 
+from src.claude_client import call_with_retry
 from src.config import (
-    SCORING_MODEL, SCORE_FLOOR, CACHE_MAX_AGE_HOURS, AMENITY_CACHE_MAX_ITEMS,
+    SCORING_MODEL, VISION_MODEL, SCORE_FLOOR, CACHE_MAX_AGE_HOURS, AMENITY_CACHE_MAX_ITEMS,
     AMENITY_TEXT_MAX_LEN, STALE_LISTING_MONTHS, MAX_PER_BUILDING, MAX_PER_NEIGHBORHOOD,
     MAX_LISTINGS_PER_BATCH, PHOTO_DOWNLOAD_SEMAPHORE, MAX_PROS_DISPLAYED, MAX_CONS_DISPLAYED,
     MAX_AMENITIES_DISPLAY, AMENITY_REQUIRED_COVERAGE, AMENITY_ENRICHMENT_MAX_WAIT_SECS,
@@ -659,8 +660,9 @@ def _filter_over_budget(
 ) -> list[Listing]:
     """Drop listings that clearly exceed the user's budget.
 
-    Keeps a listing if EITHER gross price or net_effective_price is within budget.
-    This handles edge cases where net > gross (rare) and gross > net (free months).
+    Keeps a listing if EITHER gross price or net_effective_price is within
+    budget — covers free-months concessions (gross over, net under) and the
+    rare case where net > gross.
     If no budget_max is set, all listings pass through.
     """
     if not prefs.budget_max:
@@ -670,7 +672,6 @@ def _filter_over_budget(
         if l.price <= prefs.budget_max:
             result.append(l)
         elif l.net_effective_price and l.net_effective_price <= prefs.budget_max:
-            # Gross over, net under — keep for LLM judgment
             result.append(l)
     return result
 
@@ -1069,11 +1070,13 @@ async def _llm_score_listings(
         client = anthropic.AsyncAnthropic(
             api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
         )
-        response = await client.messages.create(
-            model=SCORING_MODEL,
-            max_tokens=8192,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
+        response = await call_with_retry(
+            lambda: client.messages.create(
+                model=SCORING_MODEL,
+                max_tokens=8192,
+                messages=[{"role": "user", "content": prompt}],
+            ),
+            label="claude.score",
         )
 
         return _parse_scoring_response(response.content[0].text, listings)
@@ -1234,11 +1237,14 @@ async def _vision_pick_batch(
     client = anthropic.AsyncAnthropic(
         api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
     )
-    response = await client.messages.create(
-        model=SCORING_MODEL,
-        max_tokens=1024,
-        system="You are a photo selector for apartment listings. Return ONLY valid JSON.",
-        messages=[{"role": "user", "content": content_blocks}],
+    response = await call_with_retry(
+        lambda: client.messages.create(
+            model=VISION_MODEL,
+            max_tokens=1024,
+            system="You are a photo selector for apartment listings. Return ONLY valid JSON.",
+            messages=[{"role": "user", "content": content_blocks}],
+        ),
+        label="claude.vision",
     )
 
     text = response.content[0].text.strip()

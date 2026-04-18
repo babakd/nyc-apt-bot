@@ -373,10 +373,10 @@ class TestBudgetMinDisplay:
         assert "$2,000" in summary
         assert "$4,000" in summary
 
-    def test_budget_max_only_shows_zero_min(self):
+    def test_budget_max_only_uses_up_to_label(self):
         prefs = Preferences(budget_max=4000)
         summary = format_preferences_summary(prefs)
-        assert "$0" in summary
+        assert "Up to" in summary
         assert "$4,000" in summary
 
 

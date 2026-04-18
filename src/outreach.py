@@ -199,13 +199,14 @@ async def send_approved_draft(
     draft.sent_at = datetime.now(timezone.utc)
     save_state(state)
 
+    from src.formatter import _escape_attr
     await telegram_bot.send_text(
         chat_id,
         f"✅ <b>Message ready for {_escape_html(listing_address)}</b>\n\n"
         f"<b>Your message:</b>\n"
         f"<pre>{_escape_html(draft.message_text)}</pre>\n\n"
         f"Open the listing and paste into the contact form:\n"
-        f'<a href="{listing_url}">Contact Agent on StreetEasy →</a>\n\n'
+        f'<a href="{_escape_attr(listing_url)}">Contact Agent on StreetEasy →</a>\n\n'
         f"Tap the message above to copy it.",
     )
 

@@ -7,28 +7,49 @@ from html import escape as _esc
 from typing import Optional
 
 from src.models import Listing
+from src.storage import load_telegraph_account, save_telegraph_account
 
 logger = logging.getLogger(__name__)
 
-# Lazy-initialized Telegraph client
+# Lazy-initialized Telegraph client (per-container)
 _telegraph = None
 
 
 async def _get_telegraph():
-    """Get or create the Telegraph client."""
+    """Get or create the Telegraph client.
+
+    Reuses a persisted access_token across containers; creates one on first use.
+    """
     global _telegraph
-    if _telegraph is None:
-        try:
-            from telegraph.aio import Telegraph
-            _telegraph = Telegraph()
-            await _telegraph.create_account(
-                short_name="StreetEasyBot",
-                author_name="StreetEasy Bot",
-            )
-        except Exception:
-            logger.exception("Failed to initialize Telegraph client")
-            raise
-    return _telegraph
+    if _telegraph is not None:
+        return _telegraph
+
+    from telegraph.aio import Telegraph
+
+    persisted = load_telegraph_account()
+    access_token = persisted.get("access_token") if isinstance(persisted, dict) else None
+
+    try:
+        if access_token:
+            _telegraph = Telegraph(access_token=access_token)
+            return _telegraph
+        _telegraph = Telegraph()
+        info = await _telegraph.create_account(
+            short_name="StreetEasyBot",
+            author_name="StreetEasy Bot",
+        )
+        token = info.get("access_token") if isinstance(info, dict) else None
+        if token:
+            save_telegraph_account({
+                "access_token": token,
+                "short_name": "StreetEasyBot",
+                "author_name": "StreetEasy Bot",
+            })
+        return _telegraph
+    except Exception:
+        logger.exception("Failed to initialize Telegraph client")
+        _telegraph = None
+        raise
 
 
 async def create_listing_page(listing: Listing) -> Optional[str]:

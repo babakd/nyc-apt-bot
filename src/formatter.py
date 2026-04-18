@@ -86,7 +86,7 @@ def format_listing_card(listing: Listing, rank: int | None = None) -> str:
         parts.append("\n" + "\n".join(bullet_lines))
 
     # Link
-    parts.append(f'\n<a href="{listing.url}">View on StreetEasy \u2192</a>')
+    parts.append(f'\n<a href="{_escape_attr(listing.url)}">View on StreetEasy \u2192</a>')
 
     return "\n".join(parts)
 
@@ -112,12 +112,13 @@ def format_preferences_summary(prefs: Preferences) -> str:
     """Format current preferences for Telegram HTML display."""
     parts = ["<b>🏠 Your Search Preferences</b>\n"]
 
-    if prefs.budget_max or prefs.budget_min:
-        budget = f"${prefs.budget_min:,}" if prefs.budget_min else "$0"
-        if prefs.budget_max:
-            budget += f" – ${prefs.budget_max:,}/mo"
+    if prefs.budget_min or prefs.budget_max:
+        if prefs.budget_min and prefs.budget_max:
+            budget = f"${prefs.budget_min:,} – ${prefs.budget_max:,}/mo"
+        elif prefs.budget_max:
+            budget = f"Up to ${prefs.budget_max:,}/mo"
         else:
-            budget += "+/mo"
+            budget = f"${prefs.budget_min:,}+/mo"
         parts.append(f"💰 Budget: {budget}")
 
     if prefs.bedrooms:
@@ -305,6 +306,11 @@ def _escape_html(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _escape_attr(text: str) -> str:
+    """Escape an HTML attribute value (URL or similar). Includes quote escaping."""
+    return _escape_html(text).replace('"', "&quot;")
 
 
 def _score_bar(score: int) -> str:
