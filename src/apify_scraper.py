@@ -135,10 +135,19 @@ def _parse_request_counts(status_message: str) -> tuple[int | None, int | None]:
 
 
 def _is_unhealthy_empty_run(run_result: ActorRunResult) -> bool:
-    """Detect SUCCEEDED runs that returned no rows because all requests failed."""
+    """Detect SUCCEEDED runs that returned no useful data because all requests failed.
+
+    Covers two WAF-block shapes:
+      1. Empty dataset + all requests failed (the classic signature).
+      2. Non-empty dataset where every start URL failed — the actor sometimes
+         writes error placeholder rows in this case, so item_count > 0 is not
+         evidence of success.
+
+    When the status message does not include request counts, we cannot
+    distinguish a real empty result from a silent block — treat it as healthy
+    rather than retrying indefinitely.
+    """
     if run_result.status != "SUCCEEDED":
-        return False
-    if run_result.items:
         return False
     if run_result.requests_succeeded is None or run_result.requests_failed is None:
         return False
