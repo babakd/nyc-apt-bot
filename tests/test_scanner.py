@@ -1429,8 +1429,13 @@ class TestLLMScoringPayload:
             assert "hood_canonical" not in listings_json_part
 
     @pytest.mark.asyncio
-    async def test_temperature_zero(self):
-        """temperature=0 is set in the LLM scoring API call."""
+    async def test_temperature_not_set_for_opus_4_7(self):
+        """Opus 4.7 deprecated the `temperature` parameter — scoring must not send it.
+
+        Previously we sent temperature=0 for determinism. The 2026-04-18
+        model bump to claude-opus-4-7 means passing that parameter triggers
+        an API error, so the call site drops it entirely.
+        """
         listings = [make_listing("1")]
         prefs = Preferences(budget_max=4000)
 
@@ -1442,7 +1447,9 @@ class TestLLMScoringPayload:
 
             call_kwargs = mock_client.messages.create.call_args
             kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
-            assert kwargs.get("temperature") == 0
+            assert "temperature" not in kwargs, (
+                "temperature must not be sent to Opus 4.7; it was deprecated"
+            )
 
     @pytest.mark.asyncio
     async def test_amenity_fields_in_prompt(self):

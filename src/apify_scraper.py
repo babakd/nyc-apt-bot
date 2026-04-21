@@ -425,7 +425,10 @@ class ApifyScraper:
                 promoted_build = await self._build_number_for_id(run_result.build_id)
                 if not promoted_build:
                     promoted_build = await self._latest_build_number()
-                if promoted_build and promoted_build != pin_before:
+                promotion_applied = bool(
+                    promoted_build and promoted_build != pin_before
+                )
+                if promotion_applied:
                     save_actor_build_pin(promoted_build)
                     logger.warning(
                         "Actor build promotion: pin_before=%s tested_latest=%s promotion_applied=True",

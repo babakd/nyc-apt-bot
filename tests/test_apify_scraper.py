@@ -561,6 +561,11 @@ class TestBuildHealthAndPinning:
         scraper._run_actor = AsyncMock(
             side_effect=[ApifyScraperError("pinned failed"), success]
         )
+        # After fallback succeeds, the policy looks up the VERSION number
+        # (e.g. "0.0.96") for the build it actually ran, and saves THAT as
+        # the pin (Apify's build= param doesn't accept internal ids).
+        scraper._build_number_for_id = AsyncMock(return_value="0.0.96")
+        scraper._latest_build_number = AsyncMock(return_value="0.0.96")
 
         with (
             patch.object(ApifyScraper, "_effective_pin", return_value="pinned-build"),
@@ -584,7 +589,7 @@ class TestBuildHealthAndPinning:
         assert scraper._run_actor.call_count == 2
         assert scraper._run_actor.call_args_list[0].kwargs["build"] == "pinned-build"
         assert scraper._run_actor.call_args_list[1].kwargs["build"] == "latest"
-        save_pin.assert_called_once_with("latest-build-id")
+        save_pin.assert_called_once_with("0.0.96")
 
     @pytest.mark.asyncio
     async def test_apify_api_error_falls_back_to_latest(self):
@@ -609,6 +614,8 @@ class TestBuildHealthAndPinning:
         api_error.status_code = 404
 
         scraper._run_actor = AsyncMock(side_effect=[api_error, success])
+        scraper._build_number_for_id = AsyncMock(return_value="0.0.96")
+        scraper._latest_build_number = AsyncMock(return_value="0.0.96")
 
         with (
             patch.object(ApifyScraper, "_effective_pin", return_value="stale-pin"),
@@ -631,7 +638,7 @@ class TestBuildHealthAndPinning:
         assert scraper._run_actor.call_count == 2
         assert scraper._run_actor.call_args_list[0].kwargs["build"] == "stale-pin"
         assert scraper._run_actor.call_args_list[1].kwargs["build"] == "latest"
-        save_pin.assert_called_once_with("latest-build-id")
+        save_pin.assert_called_once_with("0.0.96")
 
 
 class TestMapDetailAmenities:
