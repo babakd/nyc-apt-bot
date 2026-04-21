@@ -284,7 +284,7 @@ async def process_telegram_update(data: dict):
     secrets=secrets,
     memory=2048,
     cpu=2.0,
-    timeout=600,
+    timeout=1500,
     schedule=modal.Cron("30 16 * * *"),
 )
 async def daily_scan():

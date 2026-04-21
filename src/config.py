@@ -159,9 +159,19 @@ ENRICHMENT_MAX_URLS = 120
 
 # --- Strict Amenity Verification ---
 
+# Coverage floor for a "verified" scan. Below this we still send listings, but
+# we warn the user and let the LLM calibrate via amenity_signal_status rather
+# than silently dropping all results.
 AMENITY_REQUIRED_COVERAGE = 0.95
-AMENITY_ENRICHMENT_MAX_WAIT_SECS = 600
-AMENITY_ENRICHMENT_NO_ITEMS_ABORT_SECS = 120
+# Minimum coverage with must-haves present before we consider the scan a no-op.
+# When enrichment drops below this AND must-haves exist, we bail out with a
+# user-visible notice. This prevents a total zero-signal dump of listings for
+# amenity-critical searches while still tolerating normal partial failures.
+AMENITY_MIN_COVERAGE_WITH_MUST_HAVES = 0.20
+# Hard budget for amenity enrichment work. Kept below the daily-scan task
+# timeout so one stuck batch can't eat the entire scan window.
+AMENITY_ENRICHMENT_MAX_WAIT_SECS = 300
+AMENITY_ENRICHMENT_NO_ITEMS_ABORT_SECS = 90
 
 # --- Search Reliability ---
 

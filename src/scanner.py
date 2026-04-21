@@ -19,7 +19,8 @@ from src.config import (
     SCORING_MODEL, VISION_MODEL, SCORE_FLOOR, CACHE_MAX_AGE_HOURS, AMENITY_CACHE_MAX_ITEMS,
     AMENITY_TEXT_MAX_LEN, STALE_LISTING_MONTHS, MAX_PER_BUILDING, MAX_PER_NEIGHBORHOOD,
     MAX_LISTINGS_PER_BATCH, PHOTO_DOWNLOAD_SEMAPHORE, MAX_PROS_DISPLAYED, MAX_CONS_DISPLAYED,
-    MAX_AMENITIES_DISPLAY, AMENITY_REQUIRED_COVERAGE, AMENITY_ENRICHMENT_MAX_WAIT_SECS,
+    MAX_AMENITIES_DISPLAY, AMENITY_REQUIRED_COVERAGE,
+    AMENITY_MIN_COVERAGE_WITH_MUST_HAVES, AMENITY_ENRICHMENT_MAX_WAIT_SECS,
     AMENITY_ENRICHMENT_NO_ITEMS_ABORT_SECS, SEARCH_FAILURE_STREAK_FOR_COOLDOWN,
     SEARCH_FAILURE_COOLDOWN_BASE_SECS, SEARCH_FAILURE_COOLDOWN_MAX_SECS,
 )
@@ -235,10 +236,17 @@ async def scan_for_chat(
                         )
                 save_state(state)
                 return
-        await telegram_bot.send_text(
-            state.chat_id,
-            "\u26a0\ufe0f I had trouble searching StreetEasy today. I'll try again tomorrow.",
-        )
+        if is_daily:
+            fallback_msg = (
+                "\u26a0\ufe0f I had trouble searching StreetEasy today "
+                "(their servers are rate-limiting us). I'll try again tomorrow."
+            )
+        else:
+            fallback_msg = (
+                "\u26a0\ufe0f StreetEasy is temporarily rate-limiting our "
+                "searches. Please try again in a few minutes."
+            )
+        await telegram_bot.send_text(state.chat_id, fallback_msg)
         save_state(state)
         return
 
@@ -339,17 +347,26 @@ async def scan_for_chat(
                 amenity_coverage * 100,
             )
             logger.info(
-                "Amenity send decision: coverage=%.3f threshold=%.3f send_allowed=%s failure_reason=%s",
+                "Amenity send decision: coverage=%.3f verified_threshold=%.3f "
+                "min_with_must_haves=%.3f failure_reason=%s",
                 amenity_coverage,
                 AMENITY_REQUIRED_COVERAGE,
-                amenity_coverage >= AMENITY_REQUIRED_COVERAGE and not amenity_failure_reason,
+                AMENITY_MIN_COVERAGE_WITH_MUST_HAVES,
                 amenity_failure_reason or "",
             )
         except Exception:
             logger.exception("Amenity enrichment failed")
             amenity_failure_reason = "enrichment_exception"
 
-        if amenity_failure_reason or amenity_coverage < AMENITY_REQUIRED_COVERAGE:
+        # Hard block only when we truly have no signal: either the whole
+        # enrichment batch errored out, or the user declared must-haves and we
+        # fell below a very low floor (i.e. nothing to show confidently).
+        hard_fail = amenity_failure_reason and enriched_count == 0
+        must_have_starved = (
+            bool(prefs.must_haves)
+            and amenity_coverage < AMENITY_MIN_COVERAGE_WITH_MUST_HAVES
+        )
+        if hard_fail or must_have_starved:
             if is_daily:
                 await telegram_bot.send_text(
                     state.chat_id,
@@ -362,6 +379,22 @@ async def scan_for_chat(
                 )
             save_state(state)
             return
+
+        # Partial coverage is okay — pass through and let the LLM scorer
+        # calibrate via amenity_signal_status. Tell the user so unexplained
+        # drops in match quality make sense.
+        amenity_partial = amenity_coverage < AMENITY_REQUIRED_COVERAGE
+        if amenity_partial:
+            logger.info(
+                "Proceeding with partial amenity coverage: coverage=%.3f",
+                amenity_coverage,
+            )
+            await telegram_bot.send_text(
+                state.chat_id,
+                "Heads up: StreetEasy blocked some amenity lookups, so a few "
+                "matches couldn't be fully verified. I'm sending what I could "
+                "confirm and scoring the rest conservatively.",
+            )
 
     # Layer 2: LLM filter + score
     scoring_result = await _llm_score_listings(filtered, prefs, state.current_apartment)

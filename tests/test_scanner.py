@@ -1429,8 +1429,13 @@ class TestLLMScoringPayload:
             assert "hood_canonical" not in listings_json_part
 
     @pytest.mark.asyncio
-    async def test_temperature_zero(self):
-        """temperature=0 is set in the LLM scoring API call."""
+    async def test_temperature_not_set_for_opus_4_7(self):
+        """Opus 4.7 deprecated the `temperature` parameter — scoring must not send it.
+
+        Previously we sent temperature=0 for determinism. The 2026-04-18
+        model bump to claude-opus-4-7 means passing that parameter triggers
+        an API error, so the call site drops it entirely.
+        """
         listings = [make_listing("1")]
         prefs = Preferences(budget_max=4000)
 
@@ -1442,7 +1447,9 @@ class TestLLMScoringPayload:
 
             call_kwargs = mock_client.messages.create.call_args
             kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
-            assert kwargs.get("temperature") == 0
+            assert "temperature" not in kwargs, (
+                "temperature must not be sent to Opus 4.7; it was deprecated"
+            )
 
     @pytest.mark.asyncio
     async def test_amenity_fields_in_prompt(self):
@@ -2381,8 +2388,8 @@ class TestEnrichmentIntegration:
         assert "Couldn't verify amenities reliably right now. Please retry shortly." in mock_bot.send_text.call_args[0][1]
 
     @pytest.mark.asyncio
-    async def test_enrichment_low_coverage_blocks_send(self):
-        """Coverage below threshold blocks listing send in manual scans."""
+    async def test_enrichment_partial_coverage_still_sends(self):
+        """Partial coverage warns the user but still sends scored listings."""
         prefs = Preferences(
             budget_max=5000,
             neighborhoods=["Chelsea"],
@@ -2405,6 +2412,60 @@ class TestEnrichmentIntegration:
             },
             coverage=0.5,
             target_count=2,
+        ))
+
+        mock_bot = AsyncMock()
+        mock_bot.send_text = AsyncMock()
+        mock_bot.send_listing_photo = AsyncMock()
+
+        scores = [
+            {"id": "1", "include": True, "score": 85, "pros": ["Doorman"], "cons": []},
+            {"id": "2", "include": True, "score": 60, "pros": [], "cons": ["Amenities unverified"]},
+        ]
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps(scores))]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        with (
+            patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client),
+            patch("src.scanner.save_state"),
+            patch("src.scanner._pick_hero_photos", return_value={}),
+        ):
+            await scan_for_chat(mock_scraper, mock_bot, state, is_daily=False)
+
+        # Scoring should run and listings should be sent (no photos → send_text).
+        mock_client.messages.create.assert_called_once()
+        sent_texts = [call.args[1] for call in mock_bot.send_text.call_args_list]
+        warn_msgs = [t for t in sent_texts if "StreetEasy blocked" in t]
+        assert warn_msgs, "Expected partial-coverage warning to be sent"
+        listing_cards = [t for t in sent_texts if "123 Test St" in t]
+        assert len(listing_cards) == 2, f"Expected 2 listing cards, got {sent_texts!r}"
+
+    @pytest.mark.asyncio
+    async def test_enrichment_must_have_starved_blocks(self):
+        """When must-haves exist and coverage is below the floor, block send."""
+        prefs = Preferences(
+            budget_max=5000,
+            neighborhoods=["Chelsea"],
+            must_haves=["Doorman"],
+        )
+        state = ChatState(chat_id=12345, preferences=prefs, preferences_ready=True)
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=[
+            _raw_listing(str(i), neighborhood="Chelsea") for i in range(1, 11)
+        ])
+        mock_scraper.enrich_with_amenities = AsyncMock(return_value=_enrichment_result(
+            {
+                "1": {
+                    "building_amenities": ["Doorman"],
+                    "unit_features": [],
+                    "description": "One verified out of ten",
+                }
+            },
+            coverage=0.1,
+            target_count=10,
         ))
 
         mock_bot = AsyncMock()
