@@ -134,24 +134,57 @@ def _parse_request_counts(status_message: str) -> tuple[int | None, int | None]:
         return (None, None)
 
 
+def _row_looks_like_listing(item: dict[str, Any]) -> bool:
+    """Return True if an actor row looks like a real listing (carries an id).
+
+    Real rows always carry a listing id somewhere — either a search-shape
+    id (``node.id`` / ``node_id`` / top-level ``id``) or a detail-shape id
+    (``basicInfo.id`` / ``federatedData.rentalByListingId.id``).
+
+    Placeholder rows the actor writes on a total WAF block (e.g.
+    ``{"message": "No results found"}``) carry none of these.
+    """
+    nested = item.get("node") if isinstance(item.get("node"), dict) else None
+    if nested and nested.get("id"):
+        return True
+    if item.get("node_id") or item.get("id"):
+        return True
+    basic_info = item.get("basicInfo") if isinstance(item.get("basicInfo"), dict) else None
+    if basic_info and basic_info.get("id"):
+        return True
+    fed = item.get("federatedData") if isinstance(item.get("federatedData"), dict) else None
+    if fed:
+        rental = fed.get("rentalByListingId") if isinstance(fed.get("rentalByListingId"), dict) else None
+        if rental and rental.get("id"):
+            return True
+    return False
+
+
 def _is_unhealthy_empty_run(run_result: ActorRunResult) -> bool:
     """Detect SUCCEEDED runs that returned no useful data because all requests failed.
 
-    Covers two WAF-block shapes:
+    Three WAF-block shapes are covered:
       1. Empty dataset + all requests failed (the classic signature).
-      2. Non-empty dataset where every start URL failed — the actor sometimes
-         writes error placeholder rows in this case, so item_count > 0 is not
-         evidence of success.
-
-    When the status message does not include request counts, we cannot
-    distinguish a real empty result from a silent block — treat it as healthy
-    rather than retrying indefinitely.
+      2. Non-empty dataset where the status message reports
+         requests_succeeded=0, requests_failed>0 — the actor wrote error
+         placeholder rows but still failed every request.
+      3. Non-empty dataset where the status message *omits* request counts
+         (we have seen ``requests_succeeded=None requests_failed=None`` from
+         the actor on partial WAF days), but every row is a placeholder with
+         no listing id. Without this branch we silently surface "no listings
+         today" while the dataset is full of ``{"message": ...}`` rows.
     """
     if run_result.status != "SUCCEEDED":
         return False
-    if run_result.requests_succeeded is None or run_result.requests_failed is None:
-        return False
-    return run_result.requests_succeeded == 0 and run_result.requests_failed > 0
+
+    rs, rf = run_result.requests_succeeded, run_result.requests_failed
+    if rs is not None and rf is not None and rs == 0 and rf > 0:
+        return True
+
+    if run_result.items and not any(_row_looks_like_listing(it) for it in run_result.items):
+        return True
+
+    return False
 
 
 class ApifyScraperError(Exception):

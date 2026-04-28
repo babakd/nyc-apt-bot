@@ -509,6 +509,114 @@ class TestBuildHealthAndPinning:
         )
         assert _is_unhealthy_empty_run(run_result) is True
 
+    def test_placeholder_only_rows_with_missing_request_counts_unhealthy(self):
+        """Regression for 2026-04-27 e2e: pipe-URL fallback returned 10
+        placeholder rows with statusMessage="" (so requests_succeeded /
+        requests_failed parsed as None). Previously the run was treated as
+        healthy and the scanner sent a misleading "no listings today" message;
+        now it must be detected as unhealthy so the build/retry chain runs.
+        """
+        run_result = ActorRunResult(
+            items=[
+                {"message": "No results found"},
+                {"message": "No results found"},
+            ],
+            run_id="r1",
+            dataset_id="d1",
+            build_id="b1",
+            status="SUCCEEDED",
+            status_message="",
+            requests_succeeded=None,
+            requests_failed=None,
+        )
+        assert _is_unhealthy_empty_run(run_result) is True
+
+    def test_real_listing_with_missing_request_counts_is_healthy(self):
+        """At least one row with a listing id means the run is healthy even
+        when statusMessage doesn't carry request counts."""
+        run_result = ActorRunResult(
+            items=[
+                {"message": "No results found"},
+                {"node_id": "12345", "node_areaName": "Chelsea"},
+            ],
+            run_id="r1",
+            dataset_id="d1",
+            build_id="b1",
+            status="SUCCEEDED",
+            status_message="",
+            requests_succeeded=None,
+            requests_failed=None,
+        )
+        assert _is_unhealthy_empty_run(run_result) is False
+
+    def test_nested_listing_id_with_missing_request_counts_is_healthy(self):
+        """Legacy nested-shape rows are recognised as real listings too."""
+        run_result = ActorRunResult(
+            items=[{"node": {"id": "12345", "areaName": "Chelsea"}}],
+            run_id="r1",
+            dataset_id="d1",
+            build_id="b1",
+            status="SUCCEEDED",
+            status_message="",
+            requests_succeeded=None,
+            requests_failed=None,
+        )
+        assert _is_unhealthy_empty_run(run_result) is False
+
+    @pytest.mark.asyncio
+    async def test_search_falls_back_when_pipe_returns_only_placeholders(self):
+        """End-to-end: when the pipe-URL run returns only WAF placeholder
+        rows with no request-count signal, the build policy must escalate to
+        the latest-build candidate instead of returning 0 listings.
+        """
+        scraper = _make_scraper()
+
+        unhealthy = ActorRunResult(
+            items=[{"message": "No results found"}] * 10,
+            run_id="pinned-run",
+            dataset_id="ds-pinned",
+            build_id="pinned-build-id",
+            status="SUCCEEDED",
+            status_message="",
+            requests_succeeded=None,
+            requests_failed=None,
+        )
+        success = ActorRunResult(
+            items=[{"node": {"id": "777", "areaName": "Chelsea"}}],
+            run_id="latest-run",
+            dataset_id="ds-latest",
+            build_id="latest-build-id",
+            status="SUCCEEDED",
+            status_message="Total 1 requests: 1 succeeded, 0 failed.",
+            requests_succeeded=1,
+            requests_failed=0,
+        )
+        scraper._run_actor = AsyncMock(side_effect=[unhealthy, success])
+        scraper._build_number_for_id = AsyncMock(return_value="0.0.112")
+        scraper._latest_build_number = AsyncMock(return_value="0.0.112")
+
+        with (
+            patch.object(ApifyScraper, "_effective_pin", return_value="0.0.111"),
+            patch.object(ApifyScraper, "_can_persist_pin", return_value=True),
+            patch("src.apify_scraper.save_actor_build_pin"),
+        ):
+            run_result = await scraper._run_actor_with_build_policy(
+                start_urls=[{"url": "https://streeteasy.com/for-rent/area:chelsea"}],
+                max_items=1000,
+                abort_after_secs_no_items=60,
+                max_wait_secs=None,
+                poll_context="search-pipe",
+                fail_on_unhealthy_empty=True,
+                force_build=None,
+                allow_build_fallback=True,
+                auto_promote_on_fallback=True,
+            )
+
+        assert run_result.run_id == "latest-run"
+        assert scraper._run_actor.call_count == 2
+        assert scraper._run_actor.call_args_list[0].kwargs["build"] == "0.0.111"
+        assert scraper._run_actor.call_args_list[1].kwargs["build"] == "latest"
+
     @pytest.mark.asyncio
     async def test_enrichment_treats_unhealthy_empty_as_failure(self):
         """SUCCEEDED+empty+all-failed status is treated as enrichment failure."""
