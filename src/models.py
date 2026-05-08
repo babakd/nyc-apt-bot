@@ -63,6 +63,16 @@ class Listing(BaseModel):
     net_effective_price: Optional[int] = None
     months_free: Optional[float] = None
     match_score: Optional[int] = Field(None, ge=0, le=100)
+    rank_score: Optional[int] = Field(
+        None,
+        ge=0,
+        le=100,
+        description="Composite score used for result ordering after local fit signals are applied",
+    )
+    rank_badges: list[str] = Field(
+        default_factory=list,
+        description="Short human-readable reasons this listing ranks well",
+    )
     pros: list[str] = Field(default_factory=list)
     cons: list[str] = Field(default_factory=list)
     scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -246,6 +246,27 @@ class TelegramBot:
                 await self._send_listing_details(chat_id, listing_id)
                 return
 
+            if data.startswith("draft:"):
+                listing_id = data.split(":", 1)[1]
+                listing = (
+                    state.recent_listings.get(listing_id)
+                    or state.liked_listings.get(listing_id)
+                )
+                if not listing:
+                    await self.send_text(
+                        chat_id,
+                        f"I don't have details for listing {listing_id}. "
+                        "Try liking a listing from search results first, then ask me to draft a message.",
+                    )
+                    return
+                try:
+                    from src.outreach import create_draft
+                    await create_draft(self, chat_id, listing)
+                except Exception:
+                    logger.exception("Draft creation failed")
+                    await self.send_text(chat_id, "⚠️ Failed to create draft. Please try again.")
+                return
+
             # Draft action callbacks
             if data.startswith("draft_send:"):
                 draft_id = data.split(":", 1)[1]

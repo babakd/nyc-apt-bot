@@ -180,6 +180,70 @@ class TestScanPipelineE2E:
         assert any("Search Results" in msg[1] for msg in text_messages)
         assert "1" in state.seen_listing_ids
 
+    @pytest.mark.asyncio
+    async def test_full_scan_ranks_better_evidence_first_and_shows_professional_card(self):
+        """Scan output ranks deterministic fit above close model score and exposes why."""
+        state = ChatState(
+            chat_id=1,
+            preferences=Preferences(
+                budget_max=4000,
+                bedrooms=[1],
+                neighborhoods=["Chelsea"],
+                must_haves=["Dishwasher"],
+                no_fee_only=True,
+            ),
+            preferences_ready=True,
+        )
+
+        raw_listings = [
+            {"listing_id": "weak", "url": "https://streeteasy.com/rental/weak",
+             "address": "90 Ninth Ave", "neighborhood": "Chelsea",
+             "price": 3900, "bedrooms": 1, "bathrooms": 1.0,
+             "photos": ["https://img.example/weak.jpg"], "amenities": []},
+            {"listing_id": "strong", "url": "https://streeteasy.com/rental/strong",
+             "address": "120 West 20th St", "neighborhood": "Chelsea",
+             "price": 3600, "bedrooms": 1, "bathrooms": 1.0, "sqft": 650,
+             "photos": ["https://img.example/strong.jpg"], "amenities": []},
+        ]
+
+        mock_scraper = AsyncMock()
+        mock_scraper.search_with_retry = AsyncMock(return_value=raw_listings)
+        mock_scraper.enrich_with_amenities = AsyncMock(return_value=AmenityEnrichmentResult(
+            data_by_listing_id={
+                "weak": {"unit_features": [], "building_amenities": ["Laundry in Building"]},
+                "strong": {"unit_features": ["Dishwasher"], "building_amenities": ["Elevator"]},
+            },
+            coverage=1.0,
+            target_count=2,
+            run_summaries=[],
+            failed=False,
+        ))
+
+        scores = [
+            {"id": "weak", "include": True, "score": 83, "pros": ["Good Chelsea block"], "cons": ["Dishwasher unverified"]},
+            {"id": "strong", "include": True, "score": 80, "pros": ["Dishwasher confirmed"], "cons": []},
+        ]
+
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps(scores))]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        bot = TrackingBot()
+
+        with patch("src.scanner.anthropic.AsyncAnthropic", return_value=mock_client), \
+             patch("src.scanner.save_state"), \
+             patch("src.scanner._pick_hero_photos", return_value={}):
+            await scan_for_chat(mock_scraper, bot, state, is_daily=False)
+
+        photo_cards = [msg for msg in bot.sent if msg[0] == "photo"]
+        assert photo_cards[0][1].startswith("#1")
+        assert "120 West 20th St" in photo_cards[0][1]
+        assert "Best signals" in photo_cards[0][1]
+        assert "Must-haves verified" in photo_cards[0][1]
+        assert "No fee" in photo_cards[0][1]
+        assert state.last_scan_listing_ids[0] == "strong"
+
 
 @pytest.mark.e2e
 class TestOutreachE2E:
