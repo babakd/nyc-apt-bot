@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 # --- Inline Keyboard Builders ---
 
 def listing_keyboard(listing_id: str, listing_url: str = "") -> list[list[dict[str, str]]]:
-    """Build inline keyboard for a listing card: Like / Pass / Details / StreetEasy."""
+    """Build inline keyboard for a listing card."""
     kb: list[list[dict[str, str]]] = [
         [
             {"text": "👍 Like", "callback_data": f"like:{listing_id}"},
@@ -23,10 +23,11 @@ def listing_keyboard(listing_id: str, listing_url: str = "") -> list[list[dict[s
         ],
         [
             {"text": "📋 Details", "callback_data": f"details:{listing_id}"},
+            {"text": "✉️ Message", "callback_data": f"draft:{listing_id}"},
         ],
     ]
     if listing_url:
-        kb[1].append({"text": "🔗 StreetEasy ↗", "url": listing_url})
+        kb.append([{"text": "🔗 Open on StreetEasy", "url": listing_url}])
     return kb
 
 
@@ -57,13 +58,12 @@ def format_listing_card(listing: Listing, rank: int | None = None) -> str:
     price_line = f"{_escape_html(listing.neighborhood)} · <b>${listing.price:,}/mo</b>"
     if listing.months_free and listing.net_effective_price:
         price_line += f" · <i>${listing.net_effective_price:,} net</i>"
-    if not listing.broker_fee:
-        price_line += " · NO FEE"
+    price_line += f" · {_escape_html(_fee_label(listing))}"
     parts.append(price_line)
 
     # Beds / baths / sqft + available date
     beds = "Studio" if listing.bedrooms == 0 else f"{listing.bedrooms} BR"
-    facts = f"{beds} · {listing.bathrooms} BA"
+    facts = f"{beds} · {_format_bathrooms(listing.bathrooms)} BA"
     if listing.sqft:
         facts += f" · {listing.sqft:,} sqft"
     parts.append(f"\n{facts}")
@@ -72,9 +72,20 @@ def format_listing_card(listing: Listing, rank: int | None = None) -> str:
         parts.append(f"Available {_escape_html(listing.available_date)}")
 
     # Match score
-    if listing.match_score is not None:
-        bar = _score_bar(listing.match_score)
-        parts.append(f"\n{bar}  <b>{listing.match_score}% match</b>")
+    display_score = _display_score(listing)
+    if display_score is not None:
+        bar = _score_bar(display_score)
+        parts.append(f"\n{bar}  <b>{display_score}% match</b>")
+        if (
+            listing.rank_score is not None
+            and listing.match_score is not None
+            and listing.rank_score != listing.match_score
+        ):
+            parts.append(f"<i>Claude match {listing.match_score}% · local fit adjusted</i>")
+
+    badges = _display_badges(listing)
+    if badges:
+        parts.append(f"<b>Best signals:</b> {_escape_html(' · '.join(badges))}")
 
     # Pros/cons as compact bullets
     if listing.pros or listing.cons:
@@ -86,7 +97,8 @@ def format_listing_card(listing: Listing, rank: int | None = None) -> str:
         parts.append("\n" + "\n".join(bullet_lines))
 
     # Link
-    parts.append(f'\n<a href="{_escape_attr(listing.url)}">View on StreetEasy \u2192</a>')
+    if listing.url:
+        parts.append(f'\n<a href="{_escape_attr(listing.url)}">View on StreetEasy \u2192</a>')
 
     return "\n".join(parts)
 
@@ -104,6 +116,11 @@ def format_listing_detail(listing: Listing) -> str:
     if listing.amenities:
         amenity_list = ", ".join(_escape_html(a) for a in listing.amenities)
         parts.append(f"\n<b>Amenities:</b> {amenity_list}")
+
+    confirmed = _combined_confirmed_amenities(listing)
+    if confirmed:
+        amenity_list = ", ".join(_escape_html(a) for a in confirmed)
+        parts.append(f"\n<b>Verified signals:</b> {amenity_list}")
 
     return "\n".join(parts)
 
@@ -229,8 +246,8 @@ def format_scan_header(count: int, is_daily: bool = True) -> str:
         return f"🔍 <b>{title}</b>\n\nNo new listings found matching your criteria."
     return (
         f"🔍 <b>{title}</b>\n\n"
-        f"Found <b>{count}</b> new listing{'s' if count != 1 else ''} "
-        f"matching your preferences, ranked by match score:"
+        f"<b>{count}</b> ranked match{'es' if count != 1 else ''} found.\n"
+        "Sorted by match score, hard constraints, verified amenities, no-fee status, and variety:"
     )
 
 
@@ -311,6 +328,59 @@ def _escape_html(text: str) -> str:
 def _escape_attr(text: str) -> str:
     """Escape an HTML attribute value (URL or similar). Includes quote escaping."""
     return _escape_html(text).replace('"', "&quot;")
+
+
+def _fee_label(listing: Listing) -> str:
+    """Return a polished broker-fee label."""
+    return listing.broker_fee or "No fee"
+
+
+def _format_bathrooms(value: float) -> str:
+    """Format bathroom count without a noisy .0 suffix."""
+    if float(value).is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _display_score(listing: Listing) -> int | None:
+    """Choose the user-facing score for a listing card."""
+    if listing.rank_score is not None:
+        return listing.rank_score
+    return listing.match_score
+
+
+def _display_badges(listing: Listing) -> list[str]:
+    """Return rank badges, with small fallbacks for older stored listings."""
+    if listing.rank_badges:
+        return listing.rank_badges[:5]
+
+    badges: list[str] = []
+    if not listing.broker_fee:
+        badges.append("No fee")
+    if listing.net_effective_price and listing.net_effective_price != listing.price:
+        badges.append("Net-effective deal")
+    if listing.sqft:
+        badges.append(f"{listing.sqft:,} sqft")
+    return badges[:3]
+
+
+def _combined_confirmed_amenities(listing: Listing) -> list[str]:
+    """Return a deduped list of strongest amenity evidence."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in (
+        listing.confirmed_unit_features
+        + listing.confirmed_building_amenities
+        + listing.unit_features
+        + listing.building_amenities
+        + listing.matched_amenities
+    ):
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result[:8]
 
 
 def _score_bar(score: int) -> str:

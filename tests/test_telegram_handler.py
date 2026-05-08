@@ -8,6 +8,7 @@ import pytest
 
 from src.models import ChatState, Draft
 from src.telegram_handler import TelegramBot
+from tests.conftest import make_listing
 
 
 @pytest.fixture
@@ -280,6 +281,49 @@ class TestDraftEditCallback:
             bot.send_text.assert_called_once()
             sent_text = bot.send_text.call_args[0][1]
             assert "no longer available" in sent_text.lower()
+
+
+class TestListingDraftCallback:
+    @pytest.mark.asyncio
+    async def test_listing_message_callback_creates_draft(self, bot):
+        """The listing card Message button starts outreach draft creation."""
+        state = ChatState(chat_id=123)
+        listing = make_listing("100")
+        state.recent_listings[listing.listing_id] = listing
+
+        callback = {
+            "id": "cb1",
+            "message": {"chat": {"id": 123}, "message_id": 1},
+            "data": "draft:100",
+        }
+
+        with patch("src.telegram_handler.load_state", return_value=state), \
+             patch("src.outreach.create_draft", new_callable=AsyncMock) as mock_create:
+            bot._answer_callback = AsyncMock()
+
+            await bot._handle_callback_query(callback)
+
+            mock_create.assert_called_once_with(bot, 123, listing)
+
+    @pytest.mark.asyncio
+    async def test_listing_message_callback_missing_listing(self, bot):
+        """Missing listing data gives a useful recovery message."""
+        state = ChatState(chat_id=123)
+
+        callback = {
+            "id": "cb1",
+            "message": {"chat": {"id": 123}, "message_id": 1},
+            "data": "draft:missing",
+        }
+
+        with patch("src.telegram_handler.load_state", return_value=state):
+            bot.send_text = AsyncMock(return_value={"ok": True})
+            bot._answer_callback = AsyncMock()
+
+            await bot._handle_callback_query(callback)
+
+            bot.send_text.assert_called_once()
+            assert "don't have details" in bot.send_text.call_args[0][1]
 
     @pytest.mark.asyncio
     async def test_edit_callback_non_pending_draft(self, bot):

@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -18,7 +19,8 @@ from src.claude_client import call_with_retry
 from src.config import (
     SCORING_MODEL, VISION_MODEL, SCORE_FLOOR, CACHE_MAX_AGE_HOURS, AMENITY_CACHE_MAX_ITEMS,
     AMENITY_TEXT_MAX_LEN, STALE_LISTING_MONTHS, MAX_PER_BUILDING, MAX_PER_NEIGHBORHOOD,
-    MAX_LISTINGS_PER_BATCH, PHOTO_DOWNLOAD_SEMAPHORE, MAX_PROS_DISPLAYED, MAX_CONS_DISPLAYED,
+    MAX_RESULTS_TO_SEND, MAX_LISTINGS_PER_BATCH, PHOTO_DOWNLOAD_SEMAPHORE,
+    MAX_PROS_DISPLAYED, MAX_CONS_DISPLAYED,
     MAX_AMENITIES_DISPLAY, AMENITY_REQUIRED_COVERAGE, AMENITY_ENRICHMENT_MAX_WAIT_SECS,
     AMENITY_ENRICHMENT_NO_ITEMS_ABORT_SECS, SEARCH_FAILURE_STREAK_FOR_COOLDOWN,
     SEARCH_FAILURE_COOLDOWN_BASE_SECS, SEARCH_FAILURE_COOLDOWN_MAX_SECS,
@@ -52,8 +54,234 @@ class FilterResult:
 
 
 def _score_key(listing: Listing) -> int:
-    """Sort key returning match_score (defaulting None to 0)."""
+    """Sort key returning composite rank_score, then match_score."""
+    if listing.rank_score is not None:
+        return listing.rank_score
     return listing.match_score or 0
+
+
+_SIGNAL_WORD_RE = re.compile(r"[^a-z0-9]+")
+
+AMENITY_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "laundry in unit": ("in unit laundry", "washer dryer", "washer and dryer", "w d in unit"),
+    "in unit laundry": ("laundry in unit", "washer dryer", "washer and dryer", "w d in unit"),
+    "laundry in building": ("building laundry", "laundry room", "laundry"),
+    "dishwasher": ("dish washer",),
+    "central ac": ("central air", "air conditioning", "a c"),
+    "doorman": ("door man", "concierge", "attended lobby"),
+    "outdoor space": ("balcony", "terrace", "roof deck", "patio", "garden"),
+    "pets allowed": ("pet friendly", "cats allowed", "dogs allowed", "pets"),
+    "gym": ("fitness center", "fitness room", "health club"),
+}
+
+
+def _normalize_signal(value: str) -> str:
+    """Normalize free text for lightweight deterministic signal matching."""
+    return _SIGNAL_WORD_RE.sub(" ", value.lower()).strip()
+
+
+def _term_variants(term: str) -> set[str]:
+    """Return normalized variants for a user preference term."""
+    normalized = _normalize_signal(term)
+    variants = {normalized}
+    for synonym in AMENITY_SYNONYMS.get(normalized, ()):
+        variants.add(_normalize_signal(synonym))
+    return {v for v in variants if v}
+
+
+def _contains_term(haystack: str, term: str) -> bool:
+    """Check whether any normalized variant of term appears in haystack."""
+    if not haystack:
+        return False
+    return any(variant in haystack for variant in _term_variants(term))
+
+
+def _listing_signal_text(listing: Listing) -> str:
+    """Combine structured and text fields into one normalized amenity signal string."""
+    parts: list[str] = []
+    for values in (
+        listing.amenities,
+        listing.matched_amenities,
+        listing.building_amenities,
+        listing.unit_features,
+        listing.confirmed_building_amenities,
+        listing.confirmed_unit_features,
+    ):
+        parts.extend(values)
+    if listing.amenity_text_dump:
+        parts.append(listing.amenity_text_dump)
+    if listing.description:
+        parts.append(listing.description)
+    return _normalize_signal(" ".join(parts))
+
+
+def _missing_signal_text(listing: Listing) -> str:
+    """Return normalized negative amenity evidence from search/enrichment data."""
+    return _normalize_signal(" ".join(listing.missing_amenities))
+
+
+def _effective_price(listing: Listing) -> int:
+    """Return the price users experience for ranking purposes."""
+    if listing.net_effective_price and listing.net_effective_price > 0:
+        return listing.net_effective_price
+    return listing.price
+
+
+def _add_badge(badges: list[str], badge: str, *, limit: int = 5) -> None:
+    """Append a short rank badge once, preserving priority order."""
+    if badge and badge not in badges and len(badges) < limit:
+        badges.append(badge)
+
+
+def _local_rank_adjustment(
+    listing: Listing,
+    prefs: Preferences,
+    current_apartment: CurrentApartment | None = None,
+) -> tuple[int, list[str]]:
+    """Compute deterministic ranking adjustment and explanation badges.
+
+    Claude remains responsible for subjective fit, but this layer makes ranking
+    stable and data-aware when the model gives close scores or misses obvious
+    structured signals like concessions, no-fee status, and verified amenities.
+    """
+    adjustment = 0
+    badges: list[str] = []
+    effective_price = _effective_price(listing)
+
+    if prefs.budget_max:
+        if effective_price <= prefs.budget_max:
+            headroom = prefs.budget_max - effective_price
+            budget_points = min(8, max(1, round((headroom / prefs.budget_max) * 32)))
+            adjustment += budget_points
+            if headroom >= 100:
+                _add_badge(badges, f"${headroom:,} under budget")
+            else:
+                _add_badge(badges, "Within budget")
+        else:
+            overage_ratio = (effective_price - prefs.budget_max) / prefs.budget_max
+            adjustment -= min(24, max(6, round(overage_ratio * 100)))
+
+    if prefs.budget_min and effective_price < prefs.budget_min:
+        adjustment -= 6
+
+    if listing.net_effective_price and listing.net_effective_price != listing.price:
+        _add_badge(badges, "Net-effective deal")
+
+    if prefs.bedrooms:
+        if listing.bedrooms in prefs.bedrooms:
+            adjustment += 4
+            _add_badge(badges, "Bedroom match")
+        else:
+            adjustment -= 18
+
+    if prefs.min_bathrooms:
+        if listing.bathrooms >= prefs.min_bathrooms:
+            adjustment += 3
+        else:
+            adjustment -= 12
+
+    if prefs.neighborhoods:
+        pref_raw = {n.lower() for n in prefs.neighborhoods}
+        pref_canonical = {_normalize_hood(n) for n in prefs.neighborhoods}
+        hood_lower = listing.neighborhood.lower()
+        hood_canonical = _normalize_hood(listing.neighborhood)
+        if hood_lower in pref_raw:
+            adjustment += 5
+            _add_badge(badges, "Preferred area")
+        elif hood_canonical in pref_canonical:
+            adjustment += 4
+            _add_badge(badges, "Preferred area")
+        else:
+            adjustment -= 8
+
+    if listing.broker_fee:
+        adjustment -= 5
+        if prefs.no_fee_only:
+            adjustment -= 20
+    else:
+        adjustment += 5
+        _add_badge(badges, "No fee")
+
+    signal_text = _listing_signal_text(listing)
+    missing_text = _missing_signal_text(listing)
+    must_hits = 0
+    for must_have in prefs.must_haves:
+        if _contains_term(missing_text, must_have):
+            adjustment -= 16
+            continue
+        if _contains_term(signal_text, must_have):
+            adjustment += 7
+            must_hits += 1
+        elif listing.amenity_signal_status == "missing":
+            adjustment -= 4
+
+    if prefs.must_haves and must_hits:
+        if must_hits == len(prefs.must_haves):
+            _add_badge(badges, "Must-haves verified")
+        else:
+            _add_badge(badges, f"{must_hits}/{len(prefs.must_haves)} must-haves")
+
+    nice_hits = 0
+    for nice_to_have in prefs.nice_to_haves:
+        if _contains_term(signal_text, nice_to_have):
+            adjustment += 3
+            nice_hits += 1
+    if nice_hits:
+        _add_badge(badges, f"{nice_hits} bonus amenity{'ies' if nice_hits != 1 else ''}")
+
+    if listing.sqft:
+        sqft_targets = {0: 400, 1: 600, 2: 800, 3: 1000}
+        target = sqft_targets.get(listing.bedrooms, 1000 + max(0, listing.bedrooms - 3) * 180)
+        if listing.sqft >= target:
+            adjustment += 3
+            _add_badge(badges, "Roomier layout")
+
+    if current_apartment:
+        current_price = current_apartment.price
+        if current_price:
+            if effective_price <= current_price:
+                adjustment += 3
+                _add_badge(badges, "Rent improvement")
+            elif effective_price > current_price * 1.1:
+                adjustment -= 3
+        if current_apartment.neighborhood:
+            if _normalize_hood(current_apartment.neighborhood) == _normalize_hood(listing.neighborhood):
+                adjustment += 2
+
+    return adjustment, badges
+
+
+def _apply_rank_scores(
+    listings: list[Listing],
+    prefs: Preferences,
+    current_apartment: CurrentApartment | None = None,
+) -> list[Listing]:
+    """Populate composite rank scores and explanation badges on listings."""
+    for listing in listings:
+        base_score = listing.match_score if listing.match_score is not None else 50
+        adjustment, badges = _local_rank_adjustment(listing, prefs, current_apartment)
+        listing.rank_score = max(0, min(100, round(base_score + adjustment)))
+        listing.rank_badges = badges
+    return listings
+
+
+def _rank_listings(
+    listings: list[Listing],
+    prefs: Preferences,
+    current_apartment: CurrentApartment | None = None,
+) -> list[Listing]:
+    """Return listings ordered by composite fit, with deterministic tie-breakers."""
+    ranked = _apply_rank_scores(listings, prefs, current_apartment)
+    return sorted(
+        ranked,
+        key=lambda l: (
+            _score_key(l),
+            l.match_score or 0,
+            -_effective_price(l),
+            l.sqft or 0,
+        ),
+        reverse=True,
+    )
 
 
 def _cooldown_remaining_secs(state: ChatState, now: datetime) -> int:
@@ -367,12 +595,13 @@ async def scan_for_chat(
     scoring_result = await _llm_score_listings(filtered, prefs, state.current_apartment)
     scored = scoring_result.listings
 
-    # Sort by score descending, then apply diversity caps
-    scored.sort(key=_score_key, reverse=True)
+    # Sort by composite fit, then apply diversity caps
+    scored = _rank_listings(scored, prefs, state.current_apartment)
     pre_building_dedup = len(scored)
     scored = _cap_per_building(scored)
     scored = _cap_per_neighborhood(scored)
     scored = _interleave_by_neighborhood(scored)
+    scored = scored[:MAX_RESULTS_TO_SEND]
 
     # Funnel logging
     logger.info(

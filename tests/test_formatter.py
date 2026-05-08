@@ -56,8 +56,8 @@ class TestListingCard:
         assert "1 BR" in card
         # New format uses middot separators
         assert "\u00b7" in card or "·" in card
-        # No broker_fee means NO FEE shown
-        assert "NO FEE" in card
+        # No broker_fee means a polished no-fee label is shown
+        assert "No fee" in card
 
     def test_card_with_broker_fee(self):
         listing = Listing(
@@ -199,6 +199,26 @@ class TestListingCard:
         card = format_listing_card(listing, rank=1)
         assert len(card) < 1024
 
+    def test_card_with_rank_score_and_badges(self):
+        """Composite ranking score and badges are visible on listing cards."""
+        listing = Listing(
+            listing_id="123",
+            url="https://streeteasy.com/rental/123",
+            address="100 Main St",
+            neighborhood="Chelsea",
+            price=3500,
+            bedrooms=1,
+            bathrooms=1.0,
+            match_score=82,
+            rank_score=91,
+            rank_badges=["No fee", "Must-haves verified"],
+        )
+        card = format_listing_card(listing, rank=1)
+        assert "91% match" in card
+        assert "Claude match 82%" in card
+        assert "Best signals" in card
+        assert "Must-haves verified" in card
+
     def test_card_caption_length_with_concession(self):
         """Card with concession data still fits within 1024-char limit."""
         listing = Listing(
@@ -254,13 +274,13 @@ class TestScanHeader:
     def test_one_result(self):
         header = format_scan_header(1)
         assert "1" in header
-        assert "listing" in header
+        assert "match" in header
         assert "ranked" in header
 
     def test_multiple_results(self):
         header = format_scan_header(5)
         assert "5" in header
-        assert "listings" in header
+        assert "matches" in header
         assert "ranked" in header
 
     def test_scan_header_manual_search(self):
@@ -291,17 +311,19 @@ class TestScanHeader:
 class TestKeyboards:
     def test_listing_keyboard_without_url(self):
         kb = listing_keyboard("123")
-        assert len(kb) == 2  # Two rows
+        assert len(kb) == 2  # No URL row
         assert any("Like" in btn["text"] for row in kb for btn in row)
         assert any("Details" in btn["text"] for row in kb for btn in row)
+        assert any("Message" in btn["text"] for row in kb for btn in row)
         # No URL button without listing_url
         assert not any("url" in btn for row in kb for btn in row)
 
     def test_listing_keyboard_with_url(self):
         kb = listing_keyboard("123", "https://streeteasy.com/rental/123")
-        assert len(kb) == 2  # Two rows
+        assert len(kb) == 3  # Actions + URL row
         assert any("Like" in btn["text"] for row in kb for btn in row)
         assert any("Details" in btn["text"] for row in kb for btn in row)
+        assert any("Message" in btn["text"] for row in kb for btn in row)
         # URL button should be present
         url_btns = [btn for row in kb for btn in row if "url" in btn]
         assert len(url_btns) == 1

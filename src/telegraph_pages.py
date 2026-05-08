@@ -71,10 +71,16 @@ async def create_listing_page(listing: Listing) -> Optional[str]:
     # Key details
     beds = "Studio" if listing.bedrooms == 0 else f"{listing.bedrooms} BR"
     fee = "No fee" if not listing.broker_fee else _esc(listing.broker_fee)
-    html_parts.append(
-        f"<p><strong>${listing.price:,}/mo</strong> · {beds} · {listing.bathrooms} BA · {fee}</p>"
-    )
-    html_parts.append(f"<p>{_esc(listing.neighborhood)}</p>")
+    facts = [
+        f"<strong>${listing.price:,}/mo</strong>",
+        beds,
+        f"{_format_bathrooms(listing.bathrooms)} BA",
+        fee,
+        _esc(listing.neighborhood),
+    ]
+    if listing.net_effective_price and listing.net_effective_price != listing.price:
+        facts.insert(1, f"${listing.net_effective_price:,} net effective")
+    html_parts.append(f"<p>{' · '.join(facts)}</p>")
 
     if listing.sqft:
         html_parts.append(f"<p>{listing.sqft:,} sqft</p>")
@@ -82,8 +88,16 @@ async def create_listing_page(listing: Listing) -> Optional[str]:
     if listing.available_date:
         html_parts.append(f"<p>Available: {_esc(listing.available_date)}</p>")
 
-    if listing.match_score is not None:
-        html_parts.append(f"<p>Match score: {listing.match_score}/100</p>")
+    display_score = listing.rank_score if listing.rank_score is not None else listing.match_score
+    if display_score is not None:
+        score_text = f"Match score: {display_score}/100"
+        if listing.rank_score is not None and listing.match_score is not None and listing.rank_score != listing.match_score:
+            score_text += f" (Claude match {listing.match_score}/100, adjusted with local fit signals)"
+        html_parts.append(f"<p><strong>{score_text}</strong></p>")
+
+    if listing.rank_badges:
+        badges = " · ".join(_esc(b) for b in listing.rank_badges[:5])
+        html_parts.append(f"<p><strong>Best signals:</strong> {badges}</p>")
 
     # Pros/cons
     if listing.pros:
@@ -98,8 +112,9 @@ async def create_listing_page(listing: Listing) -> Optional[str]:
         html_parts.append(f"<h4>Description</h4><p>{_esc(listing.description)}</p>")
 
     # Amenities
-    if listing.amenities:
-        items = "".join(f"<li>{_esc(a)}</li>" for a in listing.amenities)
+    amenities = _combined_amenities(listing)
+    if amenities:
+        items = "".join(f"<li>{_esc(a)}</li>" for a in amenities)
         html_parts.append(f"<h4>Amenities</h4><ul>{items}</ul>")
 
     # StreetEasy link
@@ -115,3 +130,30 @@ async def create_listing_page(listing: Listing) -> Optional[str]:
     except Exception:
         logger.exception("Failed to create Telegraph page for listing %s", listing.listing_id)
         return None
+
+
+def _format_bathrooms(value: float) -> str:
+    """Format bathroom count without a noisy .0 suffix."""
+    if float(value).is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _combined_amenities(listing: Listing) -> list[str]:
+    """Return deduped amenities with verified detail-page fields first."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in (
+        listing.confirmed_unit_features
+        + listing.confirmed_building_amenities
+        + listing.unit_features
+        + listing.building_amenities
+        + listing.matched_amenities
+        + listing.amenities
+    ):
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result

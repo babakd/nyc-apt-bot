@@ -39,6 +39,7 @@ from src.scanner import (
     _normalize_hood,
     _parse_listing,
     _pick_hero_photos,
+    _rank_listings,
     _sample_photo_keys,
     _vision_pick_heroes,
     scan_for_chat,
@@ -547,6 +548,73 @@ class TestLLMScoring:
             assert "East Village" in prompt_text
             assert "great light" in prompt_text
             assert "noisy street" in prompt_text
+
+
+# ---------------------------------------------------------------------------
+# B2) Deterministic ranking overlay tests
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicRanking:
+    def test_verified_must_have_can_beat_slightly_higher_llm_score(self):
+        """Local fit signals break close LLM-score ties in favor of better evidence."""
+        prefs = Preferences(
+            budget_max=4000,
+            bedrooms=[1],
+            neighborhoods=["Chelsea"],
+            must_haves=["Dishwasher"],
+            no_fee_only=True,
+        )
+        weaker = make_listing(
+            "weaker",
+            neighborhood="Chelsea",
+            price=3900,
+            bedrooms=1,
+            match_score=84,
+            missing_amenities=["Dishwasher"],
+        )
+        stronger = make_listing(
+            "stronger",
+            neighborhood="Chelsea",
+            price=3600,
+            bedrooms=1,
+            match_score=82,
+            confirmed_unit_features=["Dishwasher"],
+            broker_fee=None,
+        )
+
+        ranked = _rank_listings([weaker, stronger], prefs)
+
+        assert ranked[0].listing_id == "stronger"
+        assert ranked[0].rank_score > ranked[1].rank_score
+        assert "Must-haves verified" in ranked[0].rank_badges
+        assert "No fee" in ranked[0].rank_badges
+
+    def test_rank_score_uses_net_effective_price_for_budget_signal(self):
+        """Concessions improve ranking when the net effective price fits budget."""
+        prefs = Preferences(budget_max=3800, bedrooms=[1], neighborhoods=["Chelsea"])
+        gross_only = make_listing(
+            "gross",
+            neighborhood="Chelsea",
+            price=3795,
+            bedrooms=1,
+            match_score=80,
+        )
+        concession = make_listing(
+            "net",
+            neighborhood="Chelsea",
+            price=4300,
+            net_effective_price=3600,
+            months_free=2.0,
+            bedrooms=1,
+            match_score=80,
+        )
+
+        ranked = _rank_listings([gross_only, concession], prefs)
+
+        assert ranked[0].listing_id == "net"
+        assert "Net-effective deal" in ranked[0].rank_badges
+        assert ranked[0].rank_score >= ranked[1].rank_score
 
 
 # ---------------------------------------------------------------------------
