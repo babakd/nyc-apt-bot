@@ -545,6 +545,56 @@ async def send_agent_message(
         volume.commit()
 
 
+# --- 4. Manual E2E Preview ---
+
+@app.function(
+    image=image,
+    volumes={"/data": volume},
+    secrets=secrets,
+    memory=2048,
+    cpu=2.0,
+    timeout=1800,
+)
+async def telegram_e2e_preview_scan(
+    chat_id: int,
+    include_seen: bool = True,
+):
+    """Send a real Telegram preview scan without mutating production search history."""
+    from src.apify_scraper import ApifyScraper
+    import src.scanner as scanner
+    from src.storage import load_state
+    from src.telegram_handler import TelegramBot
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    volume.reload()
+    state = load_state(chat_id).model_copy(deep=True)
+    if include_seen:
+        state.seen_listing_ids.clear()
+
+    scraper = ApifyScraper()
+    bot = TelegramBot(token=os.environ["SE_TELEGRAM_BOT_TOKEN"])
+
+    original_save_state = scanner.save_state
+    scanner.save_state = lambda _state: None
+    try:
+        await bot.send_text(
+            chat_id,
+            "🧪 <b>E2E preview scan</b>\n\n"
+            "Sending a real Telegram rendering of the improved ranking and listing cards. "
+            "This preview does not update your seen-listing history.",
+        )
+        await scanner.scan_for_chat(scraper, bot, state, is_daily=False)
+    finally:
+        scanner.save_state = original_save_state
+        await bot.close()
+
+
+@app.local_entrypoint()
+def e2e_preview(chat_id: int = 151497543, include_seen: bool = True):
+    """Run a real Telegram preview scan for visual E2E validation."""
+    telegram_e2e_preview_scan.remote(chat_id, include_seen)
+
+
 # --- Setup Helper ---
 
 @app.function(image=image, secrets=secrets)

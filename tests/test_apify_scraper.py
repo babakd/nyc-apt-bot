@@ -80,6 +80,38 @@ class TestPollingAndAbort:
         mock_run_client.abort.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_partial_stop_after_item_target(self):
+        """Interactive searches can stop once enough candidate rows are available."""
+        scraper = _make_scraper()
+
+        mock_run_info = {"id": "run123", "defaultDatasetId": "ds123"}
+        mock_actor = AsyncMock()
+        mock_actor.start = AsyncMock(return_value=mock_run_info)
+        scraper._client.actor = MagicMock(return_value=mock_actor)
+
+        mock_run_client = AsyncMock()
+        mock_run_client.get = AsyncMock(return_value={"status": "RUNNING"})
+        mock_run_client.abort = AsyncMock()
+        scraper._client.run = MagicMock(return_value=mock_run_client)
+
+        mock_ds_client = AsyncMock()
+        mock_ds_client.get = AsyncMock(return_value={"itemCount": 2})
+        mock_ds_client.list_items = AsyncMock(return_value=MagicMock(items=[{"id": "1"}, {"id": "2"}]))
+        scraper._client.dataset = MagicMock(return_value=mock_ds_client)
+
+        with patch("src.apify_scraper.asyncio.sleep", new_callable=AsyncMock):
+            result = await scraper._run_actor(
+                start_urls=[{"url": "https://streeteasy.com/for-rent/chelsea"}],
+                max_items=2,
+                allow_partial_after_items=True,
+            )
+
+        assert result.status == "PARTIAL"
+        assert len(result.items) == 2
+        assert "Stopped after collecting" in result.status_message
+        mock_run_client.abort.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_successful_run_completes(self):
         """Run that succeeds on 2nd poll returns listings."""
         scraper = _make_scraper()
@@ -565,6 +597,12 @@ class TestBuildHealthAndPinning:
         with (
             patch.object(ApifyScraper, "_effective_pin", return_value="pinned-build"),
             patch.object(ApifyScraper, "_can_persist_pin", return_value=True),
+            patch.object(
+                ApifyScraper,
+                "_build_number_for_id",
+                new_callable=AsyncMock,
+                return_value="0.0.95",
+            ),
             patch("src.apify_scraper.save_actor_build_pin") as save_pin,
         ):
             run_result = await scraper._run_actor_with_build_policy(
@@ -584,7 +622,7 @@ class TestBuildHealthAndPinning:
         assert scraper._run_actor.call_count == 2
         assert scraper._run_actor.call_args_list[0].kwargs["build"] == "pinned-build"
         assert scraper._run_actor.call_args_list[1].kwargs["build"] == "latest"
-        save_pin.assert_called_once_with("latest-build-id")
+        save_pin.assert_called_once_with("0.0.95")
 
     @pytest.mark.asyncio
     async def test_apify_api_error_falls_back_to_latest(self):
@@ -613,6 +651,12 @@ class TestBuildHealthAndPinning:
         with (
             patch.object(ApifyScraper, "_effective_pin", return_value="stale-pin"),
             patch.object(ApifyScraper, "_can_persist_pin", return_value=True),
+            patch.object(
+                ApifyScraper,
+                "_build_number_for_id",
+                new_callable=AsyncMock,
+                return_value="0.0.95",
+            ),
             patch("src.apify_scraper.save_actor_build_pin") as save_pin,
         ):
             run_result = await scraper._run_actor_with_build_policy(
@@ -631,7 +675,7 @@ class TestBuildHealthAndPinning:
         assert scraper._run_actor.call_count == 2
         assert scraper._run_actor.call_args_list[0].kwargs["build"] == "stale-pin"
         assert scraper._run_actor.call_args_list[1].kwargs["build"] == "latest"
-        save_pin.assert_called_once_with("latest-build-id")
+        save_pin.assert_called_once_with("0.0.95")
 
 
 class TestMapDetailAmenities:

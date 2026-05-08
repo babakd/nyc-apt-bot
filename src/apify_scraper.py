@@ -17,6 +17,8 @@ from src.config import (
     STREETEASY_RENTALS,
     POLL_INTERVAL_SECS,
     ABORT_AFTER_SECS_NO_ITEMS,
+    SEARCH_MAX_ITEMS,
+    SEARCH_MAX_WAIT_SECS,
     ENRICHMENT_NO_ITEMS_ABORT_SECS,
     ENRICHMENT_MAX_WAIT_SECS,
     ENRICHMENT_RETRY_BATCH_SIZE,
@@ -224,6 +226,7 @@ class ApifyScraper:
         max_wait_secs: int | None = None,
         poll_context: str = "",
         build: str | None = None,
+        allow_partial_after_items: bool = False,
     ) -> ActorRunResult:
         """Run the actor with given startUrls and poll until completion."""
         run_input = {
@@ -249,6 +252,8 @@ class ApifyScraper:
         dataset_client = self._client.dataset(dataset_id)
         elapsed = 0
         run_data: dict[str, Any] | None = None
+        partial_stop = False
+        partial_status_message = ""
 
         while True:
             await asyncio.sleep(POLL_INTERVAL_SECS)
@@ -269,6 +274,20 @@ class ApifyScraper:
                 status,
                 item_count,
             )
+
+            if allow_partial_after_items and max_items and item_count >= max_items:
+                logger.info(
+                    "Stopping Apify run after reaching %d items%s",
+                    item_count,
+                    f" [{poll_context}]" if poll_context else "",
+                )
+                await run_client.abort()
+                partial_stop = True
+                partial_status_message = (
+                    f"Stopped after collecting {item_count} items "
+                    f"(target {max_items})"
+                )
+                break
 
             if max_wait_secs is not None and elapsed >= max_wait_secs:
                 logger.warning(
@@ -297,12 +316,14 @@ class ApifyScraper:
                 )
 
         status = str((run_data or {}).get("status", ""))
-        if status != "SUCCEEDED":
+        if partial_stop:
+            status = "PARTIAL"
+        elif status != "SUCCEEDED":
             raise ApifyScraperError(f"Actor run failed with status: {status}")
 
         result = await dataset_client.list_items()
         items = list(result.items)
-        status_message = str((run_data or {}).get("statusMessage", "") or "")
+        status_message = partial_status_message or str((run_data or {}).get("statusMessage", "") or "")
         requests_succeeded, requests_failed = _parse_request_counts(status_message)
 
         return ActorRunResult(
@@ -344,6 +365,7 @@ class ApifyScraper:
         force_build: str | None,
         allow_build_fallback: bool,
         auto_promote_on_fallback: bool,
+        allow_partial_after_items: bool = False,
     ) -> ActorRunResult:
         """Run actor with pinned build + latest fallback and optional auto-promotion."""
         pin_before = self._effective_pin()
@@ -378,6 +400,7 @@ class ApifyScraper:
                     max_wait_secs=max_wait_secs,
                     poll_context=poll_context,
                     build=build_candidate,
+                    allow_partial_after_items=allow_partial_after_items,
                 )
             except Exception as e:
                 last_error = e
@@ -411,6 +434,7 @@ class ApifyScraper:
                 and self._can_persist_pin()
                 and not force_build
             ):
+                promotion_applied = False
                 # Save the build VERSION number (e.g. '0.0.95'), not the
                 # internal build id — Apify only accepts tag/version in build=.
                 promoted_build = await self._build_number_for_id(run_result.build_id)
@@ -418,6 +442,7 @@ class ApifyScraper:
                     promoted_build = await self._latest_build_number()
                 if promoted_build and promoted_build != pin_before:
                     save_actor_build_pin(promoted_build)
+                    promotion_applied = True
                     logger.warning(
                         "Actor build promotion: pin_before=%s tested_latest=%s promotion_applied=True",
                         pin_before or "<none>",
@@ -441,14 +466,15 @@ class ApifyScraper:
 
         run_result = await self._run_actor_with_build_policy(
             start_urls=[{"url": url}],
-            max_items=1000,
+            max_items=SEARCH_MAX_ITEMS,
             abort_after_secs_no_items=ABORT_AFTER_SECS_NO_ITEMS,
-            max_wait_secs=None,
+            max_wait_secs=SEARCH_MAX_WAIT_SECS,
             poll_context="search-pipe",
             fail_on_unhealthy_empty=True,
             force_build=None,
             allow_build_fallback=True,
             auto_promote_on_fallback=True,
+            allow_partial_after_items=True,
         )
 
         listings = [_map_apify_item(item) for item in run_result.items]
@@ -456,7 +482,11 @@ class ApifyScraper:
         logger.info("Fetched %d listings from Apify (pipe URL)", len(listings))
         return listings
 
-    async def search_by_neighborhoods(self, prefs: Preferences, max_items: int = 2000) -> list[dict[str, Any]]:
+    async def search_by_neighborhoods(
+        self,
+        prefs: Preferences,
+        max_items: int = SEARCH_MAX_ITEMS,
+    ) -> list[dict[str, Any]]:
         """Search using path-style URLs for each neighborhood in a single actor run."""
         start_urls = _build_path_urls(prefs)
         if not start_urls:
@@ -471,12 +501,13 @@ class ApifyScraper:
             start_urls=start_urls,
             max_items=max_items,
             abort_after_secs_no_items=ABORT_AFTER_SECS_NO_ITEMS,
-            max_wait_secs=None,
+            max_wait_secs=SEARCH_MAX_WAIT_SECS,
             poll_context="search-path",
             fail_on_unhealthy_empty=True,
             force_build=None,
             allow_build_fallback=True,
             auto_promote_on_fallback=True,
+            allow_partial_after_items=True,
         )
 
         listings = [_map_apify_item(item) for item in run_result.items]

@@ -1429,8 +1429,8 @@ class TestLLMScoringPayload:
             assert "hood_canonical" not in listings_json_part
 
     @pytest.mark.asyncio
-    async def test_temperature_zero(self):
-        """temperature=0 is set in the LLM scoring API call."""
+    async def test_temperature_omitted_for_current_model(self):
+        """Current scoring model rejects temperature, so keep the call API-compatible."""
         listings = [make_listing("1")]
         prefs = Preferences(budget_max=4000)
 
@@ -1442,7 +1442,7 @@ class TestLLMScoringPayload:
 
             call_kwargs = mock_client.messages.create.call_args
             kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
-            assert kwargs.get("temperature") == 0
+            assert "temperature" not in kwargs
 
     @pytest.mark.asyncio
     async def test_amenity_fields_in_prompt(self):
