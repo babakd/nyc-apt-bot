@@ -505,9 +505,9 @@ async def scan_for_chat(
     if not filtered and parsed:
         logger.info("All %d listings filtered out by local pre-filters", len(parsed))
         if is_daily:
-            msg = "\ud83d\udd0d No listings found in your neighborhoods today. I'll check again tomorrow!"
+            msg = "\U0001f50d No listings found in your neighborhoods today. I'll check again tomorrow!"
         else:
-            msg = "\ud83d\udd0d No listings found in your neighborhoods."
+            msg = "\U0001f50d No listings found in your neighborhoods."
         await telegram_bot.send_text(state.chat_id, msg)
         save_state(state)
         return

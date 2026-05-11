@@ -701,6 +701,13 @@ class TestScanForChat:
         ]
         assert any("No listings found in your neighborhoods" in t for t in sent_texts)
 
+        # Regression: every outbound message must be UTF-8 encodable. A prior
+        # version used a UTF-16 surrogate-pair escape ("🔍") for the
+        # 🔍 emoji, which produced lone surrogates that httpx could not encode
+        # when POSTing to the Telegram API.
+        for t in sent_texts:
+            t.encode("utf-8")
+
     @pytest.mark.asyncio
     async def test_scored_listings_sent(self):
         """Scored listings are sent to telegram as listing cards."""
